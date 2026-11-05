@@ -1,0 +1,22 @@
+title: Audio Recording
+type: community
+group: Audio/Speech Processing
+image: /static/templates/thumbnail-audio-sentiment.png
+details: |
+  <h1>Record audio from the microphone</h1>
+  <dl>
+    <dt>Industry Applications</dt>
+    <dd>speech data collection, pronunciation assessment, voice cloning datasets, dialect recording, language documentation, read speech corpus creation, voice command collection</dd>
+    <dt>Associated Models</dt>
+    <dd>Whisper, Wav2Vec2, TTS models, Speaker verification models</dd>
+    <dt>Domain Terminology</dt>
+    <dd>audio recording, speech collection, voice capture, microphone input, read speech</dd>
+  </dl>
+config: |
+  <View>
+      <Header value="Read the following text aloud:" />
+      <Text name="prompt" value="$prompt" />
+      <Microphone name="mic" />
+      <TextArea name="transcription" toName="mic"
+                placeholder="Optional: type what you actually said" />
+  </View>

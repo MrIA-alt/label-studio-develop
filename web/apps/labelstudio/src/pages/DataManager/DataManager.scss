@@ -1,0 +1,38 @@
+.datamanager {
+  height: calc(100vh - var(--header-height));
+  position: relative;
+  z-index: 1;
+
+  #label-studio-dm [class*="Annotations_annotation_selected"] {
+    background: var(--color-primary-surface-content);
+  }
+}
+
+.datamanager * {
+  font-family: var(--font-sans) !important;
+}
+
+/* QA read-only mode: disable editing controls in the labeling interface */
+.dm-readonly {
+  /* Disable all control tags (choices, labels, textareas, etc.) */
+  [class*="Controls_wrapper"],
+  [class*="Choice_choice"],
+  [class*="Label_label"],
+  [class*="TextArea_wrapper"],
+  [class*="Rating_wrapper"] {
+    pointer-events: none;
+    opacity: 0.7;
+  }
+
+  /* Disable drawing/editing on canvas regions */
+  [class*="ImageView_"] canvas,
+  [class*="RichText_"] [contenteditable] {
+    pointer-events: none;
+  }
+
+  /* Hide the bottom action bar (submit/update/skip) */
+  [class*="BottomBar_wrapper"],
+  [class*="Controls_block"] {
+    display: none;
+  }
+}

@@ -1,0 +1,281 @@
+.microphone-tag {
+  margin: 8px 0;
+  padding: 16px;
+  border: 1px solid var(--color-neutral-border, #e1ded5);
+  border-radius: var(--corner-radius-small, 8px);
+  background: var(--color-neutral-background, #fdfdfc);
+
+  // ── Record button ──────────────────────────────────────────────────
+  &__record-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: var(--corner-radius-small, 8px);
+    background: rgb(204 94 70); // persimmon-600
+    color: #fff;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 150ms ease-out;
+
+    &:hover {
+      background: rgb(179 82 61); // persimmon-700
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(204, 94, 70, 0.3);
+    }
+
+    &:active {
+      transform: translateY(0);
+    }
+  }
+
+  &__record-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3);
+  }
+
+  // ── Recording state ────────────────────────────────────────────────
+  &__recording {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  &__live-waveform {
+    width: 100%;
+    height: 88px;
+    border-radius: 6px;
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    display: block;
+  }
+
+  &__recording-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  &__pulse {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: rgb(204 94 70);
+    flex-shrink: 0;
+    animation: mic-pulse 1.2s ease-in-out infinite;
+    box-shadow: 0 0 0 3px rgba(204, 94, 70, 0.15);
+  }
+
+  &__timer {
+    font-family: var(--font-mono, "IBM Plex Mono", monospace);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-neutral-content, #262522);
+    letter-spacing: 0.02em;
+  }
+
+  &__stop-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    padding: 6px 14px;
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    border-radius: 6px;
+    background: var(--color-neutral-surface, #f9f8f6);
+    color: var(--color-neutral-content, #262522);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 150ms ease-out;
+
+    &:hover {
+      background: var(--color-neutral-background, #fdfdfc);
+      border-color: rgb(204 94 70);
+      color: rgb(204 94 70);
+    }
+  }
+
+  // ── Playback state ─────────────────────────────────────────────────
+  &__playback {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  &__player {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  &__playback-waveform {
+    width: 100%;
+    height: 88px;
+    border-radius: 6px 6px 0 0;
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    border-bottom: none;
+    cursor: pointer;
+    display: block;
+    transition: border-color 150ms;
+
+    &:hover {
+      border-color: var(--color-primary-border, #4c5fa9);
+    }
+  }
+
+  &__player-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--color-neutral-surface, #f9f8f6);
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    border-radius: 0 0 6px 6px;
+  }
+
+  &__play-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    border-radius: 50%;
+    background: var(--color-neutral-background, #fdfdfc);
+    color: var(--color-primary-surface, #4c5fa9);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 150ms ease-out;
+
+    &:hover {
+      background: var(--color-primary-surface, #4c5fa9);
+      border-color: var(--color-primary-surface, #4c5fa9);
+      color: #fff;
+    }
+  }
+
+  &__time {
+    font-family: var(--font-mono, "IBM Plex Mono", monospace);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-neutral-icon, #45433e);
+    flex-shrink: 0;
+    min-width: 36px;
+  }
+
+  &__progress-track {
+    flex: 1;
+    height: 4px;
+    background: var(--color-neutral-border, #e1ded5);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  &__progress-fill {
+    height: 100%;
+    background: var(--color-primary-surface, #4c5fa9);
+    border-radius: 2px;
+    transition: width 100ms linear;
+  }
+
+  // ── Playback actions ───────────────────────────────────────────────
+  &__playback-actions {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  &__rerecord-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--color-neutral-icon, #45433e);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 150ms ease-out;
+
+    &:hover {
+      border-color: rgb(204 94 70);
+      color: rgb(204 94 70);
+      background: rgba(204, 94, 70, 0.05);
+    }
+  }
+
+  &__kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    margin-left: 4px;
+    font-family: var(--font-mono, "IBM Plex Mono", monospace);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 16px;
+    color: var(--color-neutral-icon, #45433e);
+    background: var(--color-neutral-background, #fdfdfc);
+    border: 1px solid var(--color-neutral-border, #e1ded5);
+    border-radius: 3px;
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06);
+  }
+
+  &__hint {
+    font-size: 12px;
+    color: var(--color-neutral-icon, #6b6860);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  &__errors {
+    margin-bottom: 8px;
+  }
+
+  &__uploading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-neutral-icon, #45433e);
+  }
+
+  &__spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--color-neutral-border, #e1ded5);
+    border-top-color: var(--color-primary-surface, #4c5fa9);
+    border-radius: 50%;
+    animation: mic-spin 0.6s linear infinite;
+  }
+}
+
+@keyframes mic-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes mic-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 3px rgba(204, 94, 70, 0.15);
+  }
+  50% {
+    opacity: 0.5;
+    box-shadow: 0 0 0 6px rgba(204, 94, 70, 0.08);
+  }
+}
