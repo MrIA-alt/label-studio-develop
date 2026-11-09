@@ -5,6 +5,39 @@ from django.conf import settings
 from drf_spectacular.utils import extend_schema_field
 from ml.models import MLBackend, MLBackendAuth
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
+
+
+def can_manage_ml(user):
+    from collab.permissions import get_service_account
+
+    return bool(
+        getattr(user, 'is_authenticated', False) and user.is_active
+        and get_service_account(user) is None and user.get_organization_role() == 'admin'
+    )
+
+
+def ensure_ml_management(user, project=None):
+    from collab.lifecycle import ensure_project_writable
+    from collab.privacy import can_access_project
+
+    # A destination receiving source credentials must be chosen by an
+    # administrator. Generic project editing never delegates that trust.
+    if not can_manage_ml(user):
+        raise PermissionDenied('Only organization administrators can manage ML backends.')
+    if project is not None:
+        if not can_access_project(user, project):
+            raise PermissionDenied('The project is not accessible.')
+        ensure_project_writable(project)
+
+
+class MLBackendSummarySerializer(serializers.ModelSerializer):
+    """Editor discovery without credentials, backend addresses or configuration."""
+
+    class Meta:
+        model = MLBackend
+        fields = ('id', 'title', 'is_interactive', 'state', 'model_version')
+        read_only_fields = fields
 
 
 class MLBackendSerializer(serializers.ModelSerializer):
@@ -81,6 +114,13 @@ class MLBackendSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+
+        request = self.context.get('request')
+        if request is not None:
+            project = attrs.get('project') or (self.instance.project if self.instance is not None else None)
+            ensure_ml_management(request.user, project)
+            if self.instance is not None and project is not None and project.pk != self.instance.project_id:
+                raise serializers.ValidationError({'project': 'An ML backend cannot be moved to another project.'})
 
         self._validate_authentication(attrs)
         self._validate_healthcheck(attrs)

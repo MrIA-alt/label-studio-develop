@@ -12,6 +12,19 @@ from tasks.models import Annotation
 from users.serializers import UserSerializer
 
 
+def scope_member_annotations(queryset, user):
+    """Membership statistics obey the same task and blind boundaries as results."""
+    from collab import privacy
+    from tasks.models import Task
+
+    visible_tasks = privacy.scope_tasks(Task.objects.all(), user)
+    return privacy.scope_task_annotations(queryset.filter(task__in=visible_tasks), user)
+
+
+def context_user(context):
+    return getattr(context.get('request'), 'user', None) or context.get('user')
+
+
 class OrganizationIdSerializer(DynamicFieldsMixin, serializers.ModelSerializer):
     class Meta:
         model = Organization
@@ -96,17 +109,23 @@ class OrganizationMemberSerializer(DynamicFieldsMixin, serializers.ModelSerializ
 
     def get_annotations_count(self, member) -> int:
         org = self.context.get('organization')
-        return member.user.annotations.filter(project__organization=org).count()
+        return scope_member_annotations(
+            member.user.annotations.filter(project__organization=org), context_user(self.context)
+        ).count()
 
     def get_contributed_projects_count(self, member) -> int:
         org = self.context.get('organization')
-        return member.user.annotations.filter(project__organization=org).values('project').distinct().count()
+        return scope_member_annotations(
+            member.user.annotations.filter(project__organization=org), context_user(self.context)
+        ).values('project').distinct().count()
 
     def get_created_projects(self, member) -> list[ProjectInfo] | None:
         if not self.context.get('contributed_to_projects', False):
             return None
         organization = self.context.get('organization')
-        projects = Project.objects.filter(created_by=member.user, organization=organization).values('id', 'title')
+        projects = Project.objects.for_user(context_user(self.context)).filter(
+            created_by=member.user, organization=organization
+        ).values('id', 'title')
         projects = projects[:100]   # Limit to 100 projects
         return [
             {
@@ -121,7 +140,10 @@ class OrganizationMemberSerializer(DynamicFieldsMixin, serializers.ModelSerializ
             return None
         organization = self.context.get('organization')
         annotations = (
-            Annotation.objects.filter(completed_by=member.user, project__organization=organization)
+            scope_member_annotations(
+                Annotation.objects.filter(completed_by=member.user, project__organization=organization),
+                context_user(self.context),
+            )
             .values('project__id', 'project__title')
             .distinct()
         )

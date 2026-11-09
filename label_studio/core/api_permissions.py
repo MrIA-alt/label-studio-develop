@@ -9,6 +9,19 @@ logger = logging.getLogger(__name__)
 
 class HasObjectPermission(BasePermission):
     def has_object_permission(self, request, view, obj):
+        from collab.privacy import can_access_project
+        from collab.lifecycle import ensure_project_writable
+
+        project = getattr(obj, 'project', None)
+        if project is None and getattr(obj, 'task_id', None):
+            project = obj.task.project
+        if obj.__class__.__name__ == 'Project':
+            project = obj
+        if project is not None and not can_access_project(request.user, project):
+            return False
+        if project is not None and request.method not in SAFE_METHODS:
+            if not (request.method == 'DELETE' and obj.__class__.__name__ == 'Project'):
+                ensure_project_writable(project)
         return obj.has_permission(request.user)
 
 
@@ -52,6 +65,14 @@ class RoleBasedPermission(BasePermission):
         user = request.user
         if not user or not user.is_authenticated:
             return False
+
+        # Service identities are governed by action scopes, never an implicit
+        # administrator organisation role. The global service gate checks them.
+        from collab.permissions import get_service_account
+
+        account = get_service_account(user)
+        if account is not None:
+            return account.active and user.is_active
 
         role = user.get_organization_role()
         if role is None:

@@ -87,8 +87,9 @@ def test_owner_actions_only_on_own_assignment(env):
     assert client_for(env['b']).post(url).status_code == 404
     resp = client_for(env['a']).post(url)
     assert resp.status_code == 200 and resp.json()['status'] == 'IN_PROGRESS'
-    # invalid transition
-    assert client_for(env['a']).post(f'/api/extensions/v1/assignments/{assignment.id}/skip').status_code == 400
+    # A task may also be skipped after starting work; terminal assignments cannot be restarted.
+    assert client_for(env['a']).post(f'/api/extensions/v1/assignments/{assignment.id}/skip').status_code == 200
+    assert client_for(env['a']).post(url).status_code == 400
 
 
 def test_staff_reassign_and_cancel(env):

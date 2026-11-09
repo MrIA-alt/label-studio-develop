@@ -4,6 +4,7 @@ strict: false
 marks:
   - usefixtures:
       - django_live_url
+      - native_project_workflow
 stages:
 
   - id: signup
@@ -28,11 +29,24 @@ stages:
       status_code: 201
 
 
+  - name: configure_source_password_without_exposing_it
+    request:
+      method: PATCH
+      url: '{django_live_url}/api/projects/{project_pk}'
+      json:
+        task_data_password: synthetic-tavern-source-password
+    response:
+      status_code: 200
+      verify_response_with:
+        function: label_studio.tests.utils:assert_task_data_password_is_not_returned
+
   - name: get_dm_project
     request:
       method: GET
       url: '{django_live_url}/api/dm/project?project={project_pk}'
     response:
+      verify_response_with:
+        function: label_studio.tests.utils:assert_task_data_password_is_not_returned
       json: {"title": "Test Draft 1", "description": "",
              "label_config": "<View><Text name=\"text\" value=\"$text\"/><Choices name=\"label\" toName=\"text\"><Choice value=\"pos\"/><Choice value=\"neg\"/></Choices></View>",
              "expert_instruction": "", "show_instruction": false, "show_skip_button": false, "enable_empty_annotation": false,
@@ -43,13 +57,14 @@ stages:
              "task_number": null, "useful_annotation_number": null, "ground_truth_number": null, "skipped_annotations_number": null,
              "total_annotations_number": null, "total_predictions_number": null, "sampling": "Sequential sampling",
              "show_ground_truth_first": false, "annotator_evaluation_enabled": false, "show_overlap_first": false, "overlap_cohort_percentage": 100,
-             "task_data_login": null, "task_data_password": null,
+             "task_data_login": null,
              "control_weights": {"label": {"overall": 1.0, "type": "Choices", "labels": {"pos": 1.0, "neg": 1.0}}},
              "parsed_label_config": {
-               "label": {"type": "Choices", "to_name": ["text"], "inputs": [{"type": "Text", "value": "text"}],
+               "label": {"type": "Choices", "to_name": ["text"], "inputs": [{"type": "Text", "valueType": null, "value": "text"}],
                          "labels": ["pos", "neg"], "labels_attrs": {"pos": {"value": "pos"}, "neg": {"value": "neg"}}}},
              "evaluate_predictions_automatically": false, "config_has_control_tags": true, "can_delete_tasks": true,
              "can_manage_annotations": true, "can_manage_tasks": true, "source_syncing": false, "target_syncing": false,
-             "task_count": 6, "annotation_count": 0}
+             "task_count": 6, "annotation_count": 0,
+             "is_archived": false, "queue_total": 6, "queue_done": 0}
 
       status_code: 200

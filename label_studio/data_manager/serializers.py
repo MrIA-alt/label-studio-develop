@@ -6,6 +6,7 @@ import ujson as json
 from core.current_request import CurrentContext
 from core.feature_flags import flag_set
 from collab.privacy import is_blind_for, own_annotations, scrub_task_representation
+from collab.privacy import get_policy
 from data_manager.models import Filter, FilterGroup, View
 from django.conf import settings
 from django.db import transaction
@@ -146,6 +147,14 @@ class ViewSerializer(serializers.ModelSerializer):
     class Meta:
         model = View
         fields = '__all__'
+        read_only_fields = ('user',)
+
+    def validate_project(self, project):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not project.has_permission(user):
+            raise serializers.ValidationError('Project is not accessible.')
+        return project
 
     def to_internal_value(self, data):
         """
@@ -495,6 +504,11 @@ class DataManagerTaskSerializer(TaskSerializer):
                 ret, obj, acting_user, pretty_results=lambda t: self._pretty_results(t, 'annotations_results')
             )
 
+        policy = get_policy(obj.project)
+        if policy is not None and not policy.allow_predictions:
+            for name in ('predictions', 'predictions_results', 'predictions_score', 'predictions_model_versions', 'total_predictions'):
+                ret.pop(name, None)
+
         return ret
 
     def _acting_user(self):
@@ -554,6 +568,9 @@ class DataManagerTaskSerializer(TaskSerializer):
         return self._pretty_results(task, 'predictions_results')
 
     def get_predictions(self, task):
+        policy = get_policy(task.project)
+        if policy is not None and not policy.allow_predictions:
+            return []
         return PredictionSerializer(task.predictions, many=True, default=[], read_only=True).data
 
     def get_annotations(self, task):

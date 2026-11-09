@@ -21,6 +21,8 @@ venv/
 .vscode
 .autoenv
 .env
+.env.collab
+collab-test-results/
 .envrc
 # web/static
 

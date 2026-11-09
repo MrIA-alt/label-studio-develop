@@ -18,6 +18,7 @@ urlpatterns = [
     # path("api/dm/tasks/<int:pk>", api.TaskAPI.as_view()),
     path('projects/<int:pk>/', views.task_page, name='project-data'),
     path('projects/<int:pk>/data/', views.task_page, name='project-data'),
+    path('projects/<int:pk>/collaboration/', views.task_page, name='project-collaboration'),
     path('projects/<int:pk>/data/import', views.task_page, name='project-import'),
     path('projects/<int:pk>/data/export', views.task_page, name='project-export'),
 ]

@@ -6,6 +6,14 @@ class TaskMixin:
         return can_access_task(user, self)
 
     def _get_is_labeled_value(self) -> bool:
+        from collab.privacy import get_policy
+
+        policy = get_policy(self.project)
+        if policy is not None:
+            n = self.annotations.filter(
+                was_cancelled=False, ground_truth=False, completed_by__isnull=False, result__isnull=False
+            ).values('completed_by').distinct().count()
+            return n >= policy.required_annotations
         n = self.completed_annotations.values('completed_by').distinct().count()
         return n >= self.overlap
 

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="fr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="same-origin"><title>Activer mon invitation — Label Studio</title></head>
+<body>
+<main style="max-width:38rem;margin:3rem auto;padding:1.5rem;font-family:system-ui">
+  <h1>Votre campagne d’annotation</h1>
+  {% if destination %}
+    <p>Votre accès est activé. Vos tâches vous attendent.</p>
+    <a href="{{ destination }}">Ouvrir mes tâches</a>
+    <script nonce="{{ request.csp_nonce }}">sessionStorage.removeItem('collab.invitation.token');</script>
+  {% else %}
+    <p>Ce lien personnel permet de retrouver les tâches préparées pour votre adresse mail.</p>
+    {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+    {% if request.user.is_authenticated %}
+      <p>Compte connecté : {{ request.user.email }}. Ce compte doit correspondre à l’adresse invitée.</p>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="logout"><button type="submit">Se déconnecter pour utiliser un autre compte</button></form>
+    {% else %}
+      <p>Vous avez déjà un compte ? <a id="invitation-login" href="{{ login_url }}">Connectez-vous avant d’accepter</a>.</p>
+      <p>Pour un nouveau compte, choisissez un mot de passe d’au moins 12 caractères.</p>
+    {% endif %}
+    <form method="post" autocomplete="off">
+      {% csrf_token %}{{ form.token }}
+      {% if not request.user.is_authenticated %}
+      <p><label>Nouveau mot de passe {{ form.password }}</label></p>
+      <p><label>Confirmer le mot de passe {{ form.confirmation }}</label></p>
+      {% endif %}
+      <button type="submit">Activer mon accès aux tâches</button>
+    </form>
+    <p id="missing-token" hidden>Ouvrez le lien personnel reçu par mail pour activer votre accès.</p>
+    <script nonce="{{ request.csp_nonce }}">
+      (() => {
+        const fromLink = new URLSearchParams(location.hash.slice(1)).get('token');
+        let token = fromLink || '';
+        try {
+          if (fromLink) sessionStorage.setItem('collab.invitation.token', fromLink);
+          token = token || sessionStorage.getItem('collab.invitation.token') || '';
+        } catch (_) { /* The mail link still works when browser storage is disabled. */ }
+        document.getElementById('id_token').value = token;
+        document.getElementById('missing-token').hidden = !!token;
+        history.replaceState(null, '', location.pathname);
+      })();
+    </script>
+  {% endif %}
+</main>
+</body></html>

@@ -2,6 +2,7 @@ import base64
 import logging
 import mimetypes
 import time
+from collab import privacy
 from typing import Union
 from urllib.parse import unquote
 
@@ -11,9 +12,10 @@ from django.http import HttpRequest, HttpResponse, HttpResponseRedirect, Streami
 from drf_spectacular.utils import extend_schema
 from projects.models import Project
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.settings import api_settings
+from core.permissions import all_permissions
 from tasks.models import Task
 
 from label_studio.io_storages.functions import get_storage_by_url
@@ -38,6 +40,26 @@ class ResolveStorageUriAPIMixin:
                 f'Failed to decode base64 {fileuri} for {model_name} {instance.id}: {exc} falling back to unquote'
             )
             fileuri = unquote(fileuri)
+
+        project = instance if isinstance(instance, Project) else instance.project
+        if privacy.is_restricted_user(request.user) or privacy.is_blind_for(request.user, project):
+            # Project resolvers have no assignment context. Task resolvers may
+            # only resolve source values actually present on the visible task.
+            if isinstance(instance, Project):
+                return Response(status=status.HTTP_403_FORBIDDEN)
+
+            def source_values(value):
+                if isinstance(value, dict):
+                    for child in value.values():
+                        yield from source_values(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from source_values(child)
+                elif isinstance(value, str):
+                    yield value
+
+            if fileuri not in source_values(instance.data):
+                return Response(status=status.HTTP_403_FORBIDDEN)
 
         # Try to find storage by URL
         project = instance if isinstance(instance, Project) else instance.project
@@ -290,7 +312,8 @@ class TaskResolveStorageUri(ResolveStorageUriAPIMixin, APIView):
     """
 
     http_method_names = ['get']
-    permission_classes = (IsAuthenticated,)
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_required = all_permissions.tasks_view
 
     def get(self, request, *args, **kwargs):
         """Get the presigned url for a given fileuri or proxy data through Label Studio"""
@@ -318,7 +341,8 @@ class ProjectResolveStorageUri(ResolveStorageUriAPIMixin, APIView):
     """
 
     http_method_names = ['get']
-    permission_classes = (IsAuthenticated,)
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_required = all_permissions.tasks_view
 
     def get(self, request, *args, **kwargs):
         """Get the presigned url for a given fileuri or proxy data through Label Studio"""

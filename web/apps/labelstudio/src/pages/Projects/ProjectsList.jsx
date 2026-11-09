@@ -99,7 +99,7 @@ const ProjectCard = ({ project, isLabeller, isAdmin, userRole }) => {
   return (
     <NavLink
       className={cn("projects-page").elem("link").toClassName()}
-      to={`/projects/${project.id}/data`}
+      to={`/projects/${project.id}/collaboration`}
       data-external
     >
       <div className={cn("project-card").mod({ colored: !!color }).toClassName()} style={projectColors}>
@@ -125,7 +125,7 @@ const ProjectCard = ({ project, isLabeller, isAdmin, userRole }) => {
                   content={
                     <Menu contextual>
                       {isAdmin && <Menu.Item href={`/projects/${project.id}/settings`}>Settings</Menu.Item>}
-                      {userRole === "qa" && <Menu.Item href={`/projects/${project.id}/settings/members`}>Members</Menu.Item>}
+                      {userRole === "qa" && <Menu.Item href={`/projects/${project.id}/collaboration`}>Supervision</Menu.Item>}
                       {isAdmin && <Menu.Item href={`/projects/${project.id}/data?labeling=1`}>Label</Menu.Item>}
                     </Menu>
                   }
@@ -137,6 +137,7 @@ const ProjectCard = ({ project, isLabeller, isAdmin, userRole }) => {
               )}
             </div>
 
+            {project.is_archived && <span className="campaign-status">Archived</span>}
             {project.state && (
               <div className={cn("project-card").elem("state-chip").toClassName()}>
                 <ProjectStateChip state={project.state} projectId={project.id} interactive={false} />

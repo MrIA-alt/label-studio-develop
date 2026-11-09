@@ -116,7 +116,7 @@ export const ReviewPanel = ({ projectId }) => {
       try {
         const response = await api.callApi("reviewAnnotation", {
           params: { pk: annotation.id },
-          body: { status: reviewStatus, comment },
+          body: { status: reviewStatus, comment, revision: annotation.revision },
         });
         if (response?.review_status) {
           setReviewResult(response);
@@ -132,7 +132,7 @@ export const ReviewPanel = ({ projectId }) => {
         setSubmitting(false);
       }
     },
-    [annotation?.id, comment],
+    [annotation?.id, annotation?.revision, comment],
   );
 
   if (!taskId || annotations.length === 0) {

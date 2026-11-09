@@ -97,7 +97,7 @@ class ContextLog(object):
     def _secure_data(self, payload, request):
         view_name = payload['view_name']
 
-        if view_name in ('user-signup', 'user-login') and payload['method'] == 'POST':
+        if view_name in ('user-signup', 'user-login', 'collab:invitation-accept') and payload['method'] == 'POST':
             payload['json'] = None
 
         if payload['status_code'] < 200 or payload['status_code'] > 299:

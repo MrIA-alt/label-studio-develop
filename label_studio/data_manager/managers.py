@@ -818,6 +818,10 @@ class PreparedTaskManager(models.Manager):
     def annotate_queryset(
         queryset, fields_for_evaluation=None, all_fields=False, excluded_fields_for_evaluation=None, request=None
     ):
+        if not all_fields and not fields_for_evaluation:
+            # No annotation function will run. Keep this query lazy rather
+            # than probing a project's first task before applying selected IDs.
+            return queryset
         annotations_map = get_annotations_map()
         # If we have dynamic control-tag level agreement columns, inject into annotation map
         # without mutating the global map
@@ -906,12 +910,16 @@ class PreparedTaskManager(models.Manager):
             queryset = TaskQuerySet(self.model).filter(project=prepare_params.project)
             projects = [prepare_params.project]
         if request is not None:
+            from collab.models import ProjectAnnotationPolicy
+
+            allow_predictions = not ProjectAnnotationPolicy.objects.filter(
+                project_id__in=[p.pk if hasattr(p, 'pk') else p for p in projects], allow_predictions=False
+            ).exists()
             for project in projects:
                 if privacy.is_blind_for(user, project):
-                    prepare_params = privacy.sanitize_prepare_params(prepare_params)
+                    prepare_params = privacy.sanitize_prepare_params(prepare_params, allow_predictions=allow_predictions)
                     break
-            if not prepare_params.is_multi_project:
-                queryset = privacy.scope_tasks(queryset, user, prepare_params.project)
+            queryset = privacy.scope_tasks(queryset, user)
         fields_for_filter_ordering = get_fields_for_filter_ordering(prepare_params)
         queryset = self.annotate_queryset(queryset, fields_for_evaluation=fields_for_filter_ordering, request=request)
         return queryset.prepared(prepare_params=prepare_params)
@@ -934,7 +942,9 @@ class TaskManager(models.Manager):
         return TaskQuerySet(self.model, using=self._db)
 
     def for_user(self, user):
-        return self.get_queryset().filter(project__organization=user.active_organization)
+        from collab.privacy import scope_tasks
+
+        return scope_tasks(self.get_queryset(), user)
 
     def with_state(self):
         """Return queryset with FSM state annotated."""

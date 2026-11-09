@@ -117,6 +117,11 @@ annotation_request_schema = {
         'project': {'type': 'integer', 'description': 'Project ID for this annotation'},
         'completed_by': {'type': 'integer', 'description': 'User ID of the person who created this annotation'},
         'updated_by': {'type': 'integer', 'description': 'Last user who updated this annotation'},
+        'revision': {
+            'type': 'integer',
+            'minimum': 1,
+            'description': 'Current annotation revision for collaborative updates. Supply this value or If-Match; a missing or stale revision returns 409.',
+        },
         'was_cancelled': {'type': 'boolean', 'description': 'User skipped the task'},
         'ground_truth': {'type': 'boolean', 'description': 'This annotation is a Ground Truth'},
         'lead_time': {
@@ -125,7 +130,6 @@ annotation_request_schema = {
             'example': 100.5,
         },
     },
-    'required': [],
     'example': {
         'result': result_example,
         'was_cancelled': False,

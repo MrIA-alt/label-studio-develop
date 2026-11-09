@@ -72,11 +72,10 @@ class ProjectMixin:
         )
 
     def has_permission(self, user):
-        """
-        Dummy stub for has_permission
-        """
+        from collab.privacy import can_access_project
+
         user.project = self  # link for activity log
-        return True
+        return can_access_project(user, self)
 
     def _can_use_overlap(self):
         """

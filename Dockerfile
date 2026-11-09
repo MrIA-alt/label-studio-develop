@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG NODE_VERSION=22
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.12
 ARG POETRY_VERSION=2.3.2
 ARG VERSION_OVERRIDE
 ARG BRANCH_OVERRIDE
@@ -24,6 +24,7 @@ ENV BUILD_NO_SERVER=true \
     YARN_CACHE_FOLDER=/root/web/.yarn \
     NX_CACHE_DIRECTORY=/root/web/.nx \
     NODE_ENV=production \
+    CYPRESS_INSTALL_BINARY=0 \
     NODE_OPTIONS="--max-old-space-size=4096"
 
 WORKDIR /label-studio/web
@@ -44,7 +45,7 @@ COPY web/yarn.lock .
 COPY web/tools tools
 RUN --mount=type=cache,target=/root/web/.yarn,id=yarn-cache,sharing=locked \
     --mount=type=cache,target=/root/web/.nx,id=nx-cache,sharing=locked \
-    yarn install --prefer-offline --no-progress --pure-lockfile --frozen-lockfile --ignore-engines --non-interactive --production=false
+    yarn install --prefer-offline --no-progress --pure-lockfile --frozen-lockfile --ignore-engines --non-interactive --production=false --network-timeout 300000 --network-concurrency 4
 
 COPY web/ .
 COPY pyproject.toml ../pyproject.toml
@@ -60,7 +61,7 @@ RUN --mount=type=cache,target=/root/web/.yarn,id=yarn-cache,sharing=locked \
     yarn version:libs
 
 ################################ Stage: venv-builder (prepare the virtualenv)
-FROM python:${PYTHON_VERSION}-alpine AS venv-builder
+FROM python:${PYTHON_VERSION}-slim-bookworm AS venv-builder
 ARG POETRY_VERSION
 ARG PYTHON_VERSION
 
@@ -76,12 +77,9 @@ ENV PYTHONUNBUFFERED=1 \
     POETRY_VIRTUALENVS_PREFER_ACTIVE_PYTHON=true \
     PATH="/opt/poetry/bin:$PATH"
 
-RUN apk add --no-cache \
-    build-base \
-    git \
-    linux-headers \
-    python3-dev \
-    pcre2-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git libpcre2-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 ADD https://install.python-poetry.org /tmp/install-poetry.py
 RUN python /tmp/install-poetry.py
@@ -100,7 +98,7 @@ COPY pyproject.toml poetry.lock README.md ./
 ARG INCLUDE_DEV=false
 
 # Install dependencies
-RUN --mount=type=cache,target=/.poetry-cache,id=poetry-cache-alpine,sharing=locked \
+RUN --mount=type=cache,target=/.poetry-cache,id=poetry-cache-bookworm,sharing=locked \
     poetry check --lock && \
     if [ "$INCLUDE_DEV" = "true" ]; then \
         poetry install --no-root --extras uwsgi --with test; \
@@ -110,7 +108,7 @@ RUN --mount=type=cache,target=/.poetry-cache,id=poetry-cache-alpine,sharing=lock
 
 # Install LS
 COPY label_studio label_studio
-RUN --mount=type=cache,target=/.poetry-cache,id=poetry-cache-alpine,sharing=locked \
+RUN --mount=type=cache,target=/.poetry-cache,id=poetry-cache-bookworm,sharing=locked \
     # `--extras uwsgi` is mandatory here due to poetry bug: https://github.com/python-poetry/poetry/issues/7302
     poetry install --only-root --extras uwsgi && \
     python3 label_studio/manage.py collectstatic --no-input
@@ -125,7 +123,7 @@ RUN --mount=type=bind,source=.git,target=./.git \
     VERSION_OVERRIDE=${VERSION_OVERRIDE} BRANCH_OVERRIDE=${BRANCH_OVERRIDE} poetry run python label_studio/core/version.py
 
 ################################### Stage: prod
-FROM python:${PYTHON_VERSION}-alpine AS production
+FROM python:${PYTHON_VERSION}-slim-bookworm AS production
 
 ENV LS_DIR=/label-studio \
     HOME=/label-studio \
@@ -139,14 +137,9 @@ ENV LS_DIR=/label-studio \
 WORKDIR $LS_DIR
 
 # install prerequisites for app
-RUN apk add --no-cache \
-    expat \
-    mesa-gl \
-    glib \
-    curl \
-    nginx \
-    bash \
-    procps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libexpat1 libgl1 libglib2.0-0 libpcre2-8-0 curl nginx bash procps \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
     mkdir -p $LS_DIR $LABEL_STUDIO_BASE_DATA_DIR $OPT_DIR && \
@@ -161,6 +154,7 @@ COPY --chown=1001:0 README.md .
 COPY --chown=1001:0 LICENSE LICENSE
 COPY --chown=1001:0 licenses licenses
 COPY --chown=1001:0 deploy deploy
+RUN python deploy/prepare_entrypoint.py
 
 # Copy files from build stages
 COPY --chown=1001:0 --from=venv-builder               $LS_DIR                                           $LS_DIR

@@ -13,6 +13,7 @@ from importlib import import_module
 from typing import Callable, Optional, TypedDict, Union
 
 from core.feature_flags import flag_set
+from core.permissions import role_has_permission
 from core.utils.common import load_func
 from data_manager.functions import DataManagerException
 from django.conf import settings
@@ -36,6 +37,19 @@ class DataManagerAction(TypedDict):
 
 def check_action_permission(user, action, project):
     """Actions must have permissions, if only one is in the user role then the action is allowed"""
+    from collab.privacy import can_access_project
+    from collab.permissions import get_service_account, has_service_scope
+
+    if not can_access_project(user, project):
+        return False
+    account = get_service_account(user)
+    if account is not None:
+        required = {
+            'next_task': 'tasks:read',
+            'delete_tasks': 'tasks:delete',
+            'delete_tasks_annotations': 'annotations:delete',
+        }.get(action.get('id'))
+        return bool(required and has_service_scope(user, required))
     if 'permission' not in action:
         logger.error('Action must have "permission" field: %s', str(action))
         return False
@@ -44,7 +58,11 @@ def check_action_permission(user, action, project):
     if not isinstance(permissions, list):
         permissions = [permissions]
     for permission in permissions:
-        if not user.has_perm(permission):
+        if not role_has_permission(user.get_organization_role(), permission) or not user.has_perm(permission):
+            return False
+        if permission == 'predictions.any' and user.get_organization_role() != 'admin':
+            # This coarse native permission also grants read access; Data Manager
+            # prediction actions create or delete results and require an admin.
             return False
     return True
 
@@ -135,12 +153,19 @@ def perform_action(action_id, project, queryset, user, **kwargs):
     if action_id not in settings.DATA_MANAGER_ACTIONS:
         raise DataManagerException("Can't find '" + action_id + "' in registered actions")
 
+    from collab.lifecycle import ensure_project_writable
+
+    ensure_project_writable(project)
     action = settings.DATA_MANAGER_ACTIONS[action_id]
     check_permission = load_func(settings.DATA_MANAGER_CHECK_ACTION_PERMISSION)
 
     # check user permissions for this action
     if not check_permission(user, action, project):
         raise PermissionDenied(f'Action is not allowed for the current user: {action["id"]}')
+
+    from collab.privacy import scope_tasks
+
+    queryset = scope_tasks(queryset, user, project)
 
     try:
         result = action['entry_point'](project, queryset, **kwargs)

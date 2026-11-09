@@ -15,6 +15,57 @@ from fsm.utils import get_or_initialize_state, is_fsm_enabled
 logger = logging.getLogger(__name__)
 
 
+def sync_collaborative_task_state(task, user=None, sync_project=True):
+    """Align the native task FSM with the current distinct-author threshold."""
+    from collab.privacy import get_policy
+    from fsm.project_transitions import update_project_state_after_task_change
+    from fsm.registry import get_state_model
+    from fsm.state_choices import TaskStateChoices
+    from fsm.state_manager import get_fsm_cache, get_state_manager
+
+    if get_policy(task.project) is None:
+        return False
+    if not is_fsm_enabled(user):
+        return True
+    if task._get_is_labeled_value():
+        expected = TaskStateChoices.COMPLETED
+    else:
+        expected = TaskStateChoices.IN_PROGRESS if task.annotations.exists() else TaskStateChoices.CREATED
+    # Cache changes do not roll back with database transactions. Compare the
+    # persisted state before deciding that a synchronization is unnecessary.
+    state_manager = get_state_manager()
+    current = get_state_model('task').get_current_state_value(task)
+    get_fsm_cache().delete(state_manager.get_cache_key(task))
+    if current != expected:
+        transition = {
+            TaskStateChoices.COMPLETED: 'task_completed',
+            TaskStateChoices.IN_PROGRESS: 'task_in_progress',
+            TaskStateChoices.CREATED: 'task_created',
+        }[expected]
+        state_manager.execute_transition(
+            entity=task, transition_name=transition, user=user, organization_id=task.project.organization_id
+        )
+        if sync_project:
+            get_fsm_cache().delete(state_manager.get_cache_key(task.project))
+            update_project_state_after_task_change(task.project, user=user)
+    return True
+
+
+def sync_collaborative_task_states(project, user=None):
+    """Resynchronize persisted native states after a campaign threshold change."""
+    from collab.privacy import get_policy
+    from fsm.project_transitions import update_project_state_after_task_change
+    from fsm.state_manager import get_fsm_cache, get_state_manager
+
+    if not is_fsm_enabled(user) or get_policy(project) is None:
+        return
+    for task in iterate_queryset(project.tasks.all()):
+        task.project = project  # Share the newly saved policy instead of stale relation caches.
+        sync_collaborative_task_state(task, user=user, sync_project=False)
+    get_fsm_cache().delete(get_state_manager().get_cache_key(project))
+    update_project_state_after_task_change(project, user=user)
+
+
 def backfill_fsm_states_for_tasks(storage_id, tasks_created, link_class):
     """
     Backfill initial FSM states for tasks created during storage sync.

@@ -4,6 +4,8 @@ import logging
 
 from collab import privacy, reviews as collab_reviews, services as collab_services
 from collab.models import AnnotationReview
+from collab.lifecycle import ensure_project_writable, is_archived
+from collab.idempotency import idempotent_mutation
 from core.feature_flags import flag_set
 from core.mixins import GetParentObjectMixin
 from core.permissions import ViewClassPermission, all_permissions
@@ -23,7 +25,7 @@ from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiRespo
 from projects.functions.stream_history import fill_history_annotation
 from projects.models import Project
 from rest_framework import generics, viewsets
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from tasks.models import Annotation, AnnotationDraft, Prediction, Task
@@ -53,6 +55,12 @@ from webhooks.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AnnotationVersionConflict(APIException):
+    status_code = 409
+    default_detail = 'The annotation changed. Reload its latest revision before saving.'
+    default_code = 'revision_conflict'
 
 
 # TODO: fix after switch to api/tasks from api/dm/tasks
@@ -188,6 +196,10 @@ class TaskListAPI(DMTaskListAPI):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['project']
 
+    @idempotent_mutation('task-create')
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
         return queryset.filter(project__organization=self.request.user.active_organization)
@@ -196,12 +208,16 @@ class TaskListAPI(DMTaskListAPI):
         context = super().get_serializer_context()
         project_id = self.request.data.get('project')
         if project_id:
-            context['project'] = generics.get_object_or_404(Project, pk=project_id)
+            project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=project_id)
+            self.check_object_permissions(self.request, project)
+            context['project'] = project
         return context
 
     def perform_create(self, serializer):
         project_id = self.request.data.get('project')
-        project = generics.get_object_or_404(Project, pk=project_id)
+        project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=project_id)
+        ensure_project_writable(project)
+        self.check_object_permissions(self.request, project)
         instance = serializer.save(project=project)
         emit_webhooks_for_instance(
             self.request.user.active_organization, project, WebhookAction.TASKS_CREATED, [instance]
@@ -337,9 +353,13 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
         context['project'] = project = self.task.project
 
         # get prediction
-        if (
+        policy = privacy.get_policy(project)
+        predictions_allowed = not (
+            privacy.is_restricted_user(request.user) and policy and not policy.allow_predictions
+        )
+        if predictions_allowed and (
             project.evaluate_predictions_automatically or project.show_collab_predictions
-        ) and not self.task.predictions.exists():
+        ) and not is_archived(project) and not self.task.predictions.exists():
             evaluate_predictions([self.task])
             # refresh task from db with prefetches
             self.task = self.get_object()
@@ -357,7 +377,9 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         task_id = self.request.parser_context['kwargs'].get('pk')
-        task = generics.get_object_or_404(Task, pk=task_id)
+        task = getattr(self, '_permission_task', None)
+        if task is None:
+            task = generics.get_object_or_404(Task.objects.select_related('project'), pk=task_id)
         review = bool_from_request(self.request.GET, 'review', False)
         selected = {'all': False, 'included': [self.kwargs.get('pk')]}
         if review:
@@ -367,9 +389,17 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
                 'all_fields': True,
                 'excluded_fields_for_evaluation': self.get_excluded_fields_for_evaluation(),
             }
+            policy = privacy.get_policy(task.project)
+            if policy is not None and not policy.allow_predictions:
+                # The serializer removes these fields for this policy.
+                # Avoid calculating their aggregates and loading ML versions.
+                kwargs['excluded_fields_for_evaluation'] = [
+                    *kwargs['excluded_fields_for_evaluation'],
+                    'predictions_model_versions', 'predictions_score',
+                ]
         project = self.request.query_params.get('project') or self.request.data.get('project')
         if not project:
-            project = task.project.id
+            project = task.project_id
         return self.prefetch(
             Task.prepared.get_queryset(
                 prepare_params=PrepareParams(project=project, selectedItems=selected, request=self.request), **kwargs
@@ -392,6 +422,7 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
             pk=task_id,
         )
         self.check_object_permissions(self.request, lean_task)
+        self._permission_task = lean_task
 
         # Now fetch full task with heavy queryset (prefetches, annotations, etc.)
         queryset = self.filter_queryset(self.get_queryset())
@@ -652,44 +683,64 @@ class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
     queryset = Annotation.objects.all()
 
     def perform_destroy(self, annotation):
-        annotation.delete()
+        from collab.permissions import get_service_account
+
+        if get_service_account(self.request.user) is not None and annotation.completed_by_id != self.request.user.pk:
+            raise PermissionDenied('Service accounts can only delete their own annotations.')
+        if privacy.get_policy(annotation.project) is not None and self.request.user.get_organization_role() == 'qa':
+            raise PermissionDenied('Reviewers preserve original annotations. Use a review decision instead.')
+        collab_services.delete_annotation(annotation)
 
     def update(self, request, *args, **kwargs):
-        # save user history with annotator_id, time & annotation result
         annotation = self.get_object()
-        restricted = privacy.is_restricted_user(request.user)
-        if restricted and str(request.data.get('completed_by', request.user.pk)) != str(request.user.pk):
-            raise PermissionDenied('You cannot change the author of an annotation.')
-        if restricted and not collab_reviews.author_edit_allowed(annotation, request.user):
-            raise PermissionDenied('This annotation is submitted and locked until a correction is requested.')
-        collab_reviews.snapshot_before_update(annotation, request.user, request.data.get('result'))
-        Annotation.objects.filter(id=annotation.id).update(updated_by=request.user)
+        from collab.permissions import get_service_account
 
-        # If annotation was reviewed (accepted or rejected), reset review status
-        # back to pending so it goes through the review workflow again
-        if annotation.review_status in (Annotation.REVIEW_ACCEPTED, Annotation.REVIEW_REJECTED):
-            Annotation.objects.filter(id=annotation.id).update(
-                review_status=Annotation.REVIEW_PENDING,
-                review_comment=None,
-                reviewed_by=None,
-                reviewed_at=None,
-            )
+        if get_service_account(request.user) is not None and annotation.completed_by_id != request.user.pk:
+            raise PermissionDenied('Service accounts can only modify their own annotations.')
+        supplied = request.headers.get('If-Match', request.data.get('revision'))
+        if supplied is None and privacy.get_policy(annotation.project) is not None:
+            raise AnnotationVersionConflict('A revision or If-Match header is required to update this annotation.')
+        try:
+            expected = int(str(supplied).strip('"')) if supplied is not None else annotation.revision
+        except (TypeError, ValueError):
+            raise ValidationError({'revision': 'Use the integer revision returned by the server.'})
+        with transaction.atomic():
+            Task.objects.select_for_update().get(pk=annotation.task_id)
+            annotation = Annotation.objects.select_for_update().get(pk=annotation.pk)
+            if annotation.revision != expected:
+                raise AnnotationVersionConflict()
+            if (
+                privacy.get_policy(annotation.project) is not None
+                and request.user.get_organization_role() == 'qa'
+                and annotation.completed_by_id != request.user.pk
+            ):
+                raise PermissionDenied('Reviewers preserve original annotations. Use review decisions or an arbitrated final annotation instead.')
+            from collab.permissions import get_service_account
 
-        task = annotation.task
-        if self.request.data.get('ground_truth'):
-            task.ensure_unique_groundtruth(annotation_id=annotation.id)
-        task.update_is_labeled()
-        task.save()  # refresh task metrics
-
-        result = super(AnnotationAPI, self).update(request, *args, **kwargs)
-        if restricted:
-            collab_reviews.after_author_update(annotation, request.user)
-        task.update_is_labeled()
-        task.save(update_fields=['updated_at'])  # refresh task metrics
-        return result
+            restricted = privacy.is_restricted_user(request.user) or get_service_account(request.user) is not None
+            if restricted and not collab_reviews.author_edit_allowed(annotation, request.user):
+                raise PermissionDenied('This annotation is submitted and locked until a correction is requested.')
+            serializer = self.get_serializer(annotation, data=request.data, partial=kwargs.get('partial', False))
+            serializer.is_valid(raise_exception=True)
+            collab_reviews.snapshot_before_update(annotation, request.user, serializer.validated_data.get('result'))
+            annotation.review_status = Annotation.REVIEW_PENDING
+            annotation.review_comment = None
+            annotation.reviewed_by = None
+            annotation.reviewed_at = None
+            annotation.revision += 1
+            serializer.save(updated_by=request.user)
+            if restricted:
+                collab_reviews.after_author_update(annotation, request.user)
+            if annotation.ground_truth:
+                annotation.task.ensure_unique_groundtruth(annotation_id=annotation.pk)
+            annotation.task.update_is_labeled()
+            annotation.task.save(update_fields=['is_labeled', 'updated_at'])
+            return Response(serializer.data, headers={'ETag': f'"{annotation.revision}"'})
 
     def get(self, request, *args, **kwargs):
-        return super(AnnotationAPI, self).get(request, *args, **kwargs)
+        response = super(AnnotationAPI, self).get(request, *args, **kwargs)
+        response['ETag'] = f'"{response.data["revision"]}"'
+        return response
 
     @api_webhook(WebhookAction.ANNOTATION_UPDATED)
     @extend_schema(exclude=True)
@@ -787,9 +838,12 @@ class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
     def get(self, request, *args, **kwargs):
         return super(AnnotationsListAPI, self).get(request, *args, **kwargs)
 
+    @idempotent_mutation('annotation-create')
     @api_webhook(WebhookAction.ANNOTATION_CREATED)
     def post(self, request, *args, **kwargs):
-        return super(AnnotationsListAPI, self).post(request, *args, **kwargs)
+        with transaction.atomic():
+            generics.get_object_or_404(Task.objects.select_for_update(), pk=self.kwargs['pk'])
+            return super(AnnotationsListAPI, self).post(request, *args, **kwargs)
 
     def get_queryset(self):
         task = generics.get_object_or_404(Task.objects.for_user(self.request.user), pk=self.kwargs.get('pk', 0))
@@ -811,6 +865,7 @@ class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
 
     def perform_create(self, ser):
         task = self.parent_object
+        ensure_project_writable(task.project)
         # annotator has write access only to annotations and it can't be checked it after serializer.save()
         user = self.request.user
         if not privacy.can_access_task(user, task):
@@ -843,7 +898,9 @@ class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
         if 'was_cancelled' in self.request.GET:
             extra_args['was_cancelled'] = bool_from_request(self.request.GET, 'was_cancelled', False)
 
-        if 'completed_by' not in ser.validated_data or privacy.is_restricted_user(user):
+        from collab.permissions import get_service_account
+
+        if 'completed_by' not in ser.validated_data or privacy.is_restricted_user(user) or get_service_account(user) is not None:
             # restricted users can only author annotations in their own name
             extra_args['completed_by'] = self.request.user
 
@@ -865,7 +922,7 @@ class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
 
         logger.debug(f'Save activity for user={self.request.user}')
         self.request.user.activity_at = timezone.now()
-        self.request.user.save()
+        self.request.user.save(update_fields=['activity_at'])
 
         # Release task if it has been taken at work (it should be taken by the same user, or it makes sentry error
         logger.debug(f'User={user} releases task={task}')
@@ -906,8 +963,13 @@ class AnnotationDraftListAPI(generics.ListCreateAPIView):
         annotation_id = self.kwargs.get('annotation_id')
         user = self.request.user
         task = generics.get_object_or_404(Task.objects.for_user(user), pk=task_id)
+        ensure_project_writable(task.project)
         if not privacy.can_access_task(user, task):
             raise PermissionDenied('You do not have permission to annotate this task')
+        if annotation_id is not None:
+            annotation = generics.get_object_or_404(Annotation, pk=annotation_id, task_id=task_id)
+            if not privacy.can_access_annotation(user, annotation) or not collab_reviews.author_edit_allowed(annotation, user):
+                raise PermissionDenied('This annotation cannot be changed.')
         logger.debug(f'User {user} is going to create draft for task={task_id}, annotation={annotation_id}')
         serializer.save(task_id=self.kwargs['pk'], annotation_id=annotation_id, user=self.request.user)
 
@@ -1091,7 +1153,38 @@ class PredictionAPI(viewsets.ModelViewSet):
     filterset_fields = ['task', 'task__project', 'project']
 
     def get_queryset(self):
-        return Prediction.objects.filter(project__organization=self.request.user.active_organization)
+        tasks = privacy.scope_tasks(Task.objects.filter(project__in=Project.objects.for_user(self.request.user)),
+                                    self.request.user, None)
+        qs = Prediction.objects.filter(task__in=tasks)
+        if privacy.is_restricted_user(self.request.user):
+            qs = qs.exclude(project__annotation_policy__allow_predictions=False)
+        return qs
+
+    def _check_write(self):
+        if self.request.user.get_organization_role() != 'admin':
+            raise PermissionDenied('Only administrators can manage predictions.')
+
+    def perform_create(self, serializer):
+        self._check_write()
+        task = serializer.validated_data.get('task')
+        project = serializer.validated_data.get('project') or (task.project if task else None)
+        if project is None or not Project.objects.for_user(self.request.user).filter(pk=project.pk).exists():
+            raise PermissionDenied('The project is not accessible.')
+        if task is not None and task.project_id != project.pk:
+            raise ValidationError({'project': 'The task belongs to another project.'})
+        serializer.save(project=project)
+
+    def perform_update(self, serializer):
+        self._check_write()
+        for name in ('task', 'project'):
+            value = serializer.validated_data.get(name)
+            if value is not None and value.pk != getattr(serializer.instance, name + '_id'):
+                raise ValidationError({'detail': 'A prediction cannot be moved to another task or project.'})
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_write()
+        instance.delete()
 
 
 @method_decorator(name='get', decorator=extend_schema(exclude=True))
@@ -1115,26 +1208,37 @@ class AnnotationConvertAPI(generics.RetrieveAPIView):
 
     def post(self, request, *args, **kwargs):
         annotation = self.get_object()
+        from collab.permissions import get_service_account
+
+        if get_service_account(request.user) is not None and annotation.completed_by_id != request.user.pk:
+            raise PermissionDenied('Service accounts can only convert their own annotations.')
+        collaborative = privacy.get_policy(annotation.project) is not None
+        if collaborative and (not annotation.was_cancelled or annotation.completed_by_id != request.user.pk):
+            raise ValidationError({'detail': 'Collaborative submitted annotations retain their history. Correct them with PATCH.'})
         organization = annotation.project.organization
         project = annotation.project
 
         pk = annotation.pk
 
         with transaction.atomic():
-            draft = AnnotationDraft.objects.create(
-                result=annotation.result,
-                lead_time=annotation.lead_time,
-                task=annotation.task,
-                annotation=None,
-                user=request.user,
-            )
+            Task.objects.select_for_update().get(pk=annotation.task_id)
+            draft = AnnotationDraft.objects.filter(task=annotation.task, annotation=None, user=request.user).order_by('-id').first() if collaborative else None
+            if draft is None:
+                draft = AnnotationDraft.objects.create(
+                    result=annotation.result, lead_time=annotation.lead_time,
+                    task=annotation.task, annotation=None, user=request.user,
+                )
 
             self.process_intermediate_state(annotation, draft)
 
-            annotation.delete()
+            if not collaborative:
+                annotation.delete()
 
-        emit_webhooks_for_instance(organization, project, WebhookAction.ANNOTATIONS_DELETED, [pk])
+        if not collaborative:
+            emit_webhooks_for_instance(organization, project, WebhookAction.ANNOTATIONS_DELETED, [pk])
         data = AnnotationDraftSerializer(instance=draft).data
+        if collaborative:
+            data['retained_annotation_id'] = pk
         return Response(status=201, data=data)
 
 
@@ -1145,6 +1249,7 @@ class AnnotationReviewAPI(generics.GenericAPIView):
     serializer_class = AnnotationReviewSerializer
     queryset = Annotation.objects.all()
 
+    @idempotent_mutation('native-review')
     def post(self, request, pk):
         if privacy.is_restricted_user(request.user):
             raise PermissionDenied('Only QA and admin users can review annotations.')
@@ -1160,7 +1265,10 @@ class AnnotationReviewAPI(generics.GenericAPIView):
         comment = serializer.validated_data.get('comment', '') or ''
         if decision == AnnotationReview.Decision.REJECT and not comment:
             comment = 'Rejected'
-        collab_reviews.apply_review(annotation, request.user, decision, comment)
+        collab_reviews.apply_review(
+            annotation, request.user, decision, comment,
+            expected_revision=request.headers.get('If-Match', serializer.validated_data.get('revision')),
+        )
         annotation.refresh_from_db()
         return Response({
             'id': annotation.id,
@@ -1168,4 +1276,5 @@ class AnnotationReviewAPI(generics.GenericAPIView):
             'review_comment': annotation.review_comment,
             'reviewed_by': annotation.reviewed_by_id,
             'reviewed_at': annotation.reviewed_at.isoformat(),
-        }, status=status.HTTP_200_OK)
+            'revision': annotation.revision,
+        }, status=status.HTTP_200_OK, headers={'ETag': f'"{annotation.revision}"'})

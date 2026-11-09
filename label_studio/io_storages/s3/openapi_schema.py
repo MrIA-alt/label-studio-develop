@@ -31,7 +31,6 @@ _s3_import_storage_schema = {
         'recursive_scan': {'type': 'boolean', 'description': 'Scan recursively'},
         **_common_s3_storage_schema_properties,
     },
-    'required': [],
 }
 
 # S3 import storage schema with ID
@@ -41,7 +40,6 @@ _s3_import_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_s3_import_storage_schema['properties'],
     },
-    'required': [],
 }
 
 # S3 export storage schema
@@ -51,7 +49,6 @@ _s3_export_storage_schema = {
         'can_delete_objects': {'type': 'boolean', 'description': 'Deletion from storage enabled.', 'default': False},
         **_common_s3_storage_schema_properties,
     },
-    'required': [],
 }
 
 # S3 export storage schema with ID
@@ -61,5 +58,4 @@ _s3_export_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_s3_export_storage_schema['properties'],
     },
-    'required': [],
 }

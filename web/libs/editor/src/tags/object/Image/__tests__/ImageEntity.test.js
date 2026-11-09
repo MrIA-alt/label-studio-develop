@@ -1,7 +1,7 @@
 /**
  * Unit tests for ImageEntity (tags/object/Image/ImageEntity.js)
  */
-import { types } from "mobx-state-tree";
+import { destroy, types } from "mobx-state-tree";
 import { ImageEntity } from "../ImageEntity";
 import { ImageEntityMixin } from "../ImageEntityMixin";
 import { imageCache } from "@humansignal/core";
@@ -72,6 +72,27 @@ function createEntityWithParent(imageCrossOrigin = "anonymous") {
 describe("ImageEntity", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it("ignores a pending image download after its annotation is destroyed", async () => {
+    let finish;
+    imageCache.load.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const store = createEntity();
+    const entity = store.imageEntities[0];
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    entity.preload();
+    destroy(store);
+    finish({ blobUrl: "blob:late-image" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(imageCache.addRef).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+    imageCache.load.mockReset();
   });
 
   describe("views", () => {

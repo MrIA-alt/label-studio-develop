@@ -153,6 +153,7 @@ const _Annotation = types
     localUpdate: types.optional(types.boolean, false),
 
     ground_truth: types.optional(types.boolean, false),
+    revision: types.optional(types.integer, 1),
     skipped: false,
 
     // This field stores all data that affects undo/redo history
@@ -432,6 +433,10 @@ const _Annotation = types
 
     setReadonly(val) {
       self.readonly = val;
+    },
+
+    setRevision(revision) {
+      self.revision = revision;
     },
 
     setIsDrawing(isDrawing) {

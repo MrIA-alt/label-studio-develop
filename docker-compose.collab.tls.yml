@@ -1,0 +1,14 @@
+# Optional TLS termination using the native Nginx configuration.
+# Set LABEL_STUDIO_HOST=https://<host>:<port> consistently for every service.
+services:
+  nginx:
+    environment:
+      NGINX_SSL_CERT: /run/collab-tls/cert.pem
+      NGINX_SSL_CERT_KEY: /run/collab-tls/key.pem
+    ports:
+      - "127.0.0.1:${COLLAB_HTTPS_PORT:-18443}:8086"
+    volumes:
+      - type: bind
+        source: ${COLLAB_TLS_DIR:?Set COLLAB_TLS_DIR to the private certificate directory}
+        target: /run/collab-tls
+        read_only: true

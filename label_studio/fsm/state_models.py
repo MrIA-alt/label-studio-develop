@@ -106,6 +106,13 @@ class BaseState(models.Model):
         entity_id = getattr(self, f'{self._get_entity_name()}_id', 'unknown')
         return f'{self._get_entity_name().title()} {entity_id}: {self.previous_state} → {self.state}'
 
+    def save(self, *args, **kwargs):
+        from fsm.bulk_state_cache import remember_initial_state
+
+        result = super().save(*args, **kwargs)
+        remember_initial_state(self)
+        return result
+
     @property
     def entity(self):
         """Get the related entity object"""
@@ -132,6 +139,11 @@ class BaseState(models.Model):
         Uses UUID7's natural time ordering to efficiently find the latest state
         without requiring created_at indexes or complex queries.
         """
+        from fsm.bulk_state_cache import CACHE_MISS, get_cached_initial_state
+
+        cached = get_cached_initial_state(cls, entity)
+        if cached is not CACHE_MISS:
+            return cached
         entity_field = f'{cls._get_entity_field_name()}'
         return cls.objects.filter(**{entity_field: entity}).order_by('-id').first()
 
@@ -143,8 +155,7 @@ class BaseState(models.Model):
         Uses UUID7's natural time ordering to efficiently find the latest state
         without requiring created_at indexes or complex queries.
         """
-        entity_field = f'{cls._get_entity_field_name()}'
-        current_state = cls.objects.filter(**{entity_field: entity}).order_by('-id').first()
+        current_state = cls.get_current_state(entity)
         return current_state.state if current_state else None
 
     @classmethod

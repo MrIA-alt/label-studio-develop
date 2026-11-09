@@ -10,6 +10,7 @@ import { cn } from "../../utils/bem";
 import { CreateProject } from "../CreateProject/CreateProject";
 import { DataManagerPage } from "../DataManager/DataManager";
 import { SettingsPage } from "../Settings";
+import { CollaborationPage } from "../Collaboration/Collaboration";
 import { EmptyProjectsList, ProjectsList } from "./ProjectsList";
 import { useAbortController, useUpdatePageTitle } from "@humansignal/core";
 import "./Projects.scss";
@@ -55,6 +56,7 @@ export const ProjectsPage = () => {
       "created_at",
       "color",
       "is_published",
+      "is_archived",
       "assignment_settings",
       "state",
     ].join(",");
@@ -170,6 +172,7 @@ ProjectsPage.routes = ({ store }) => [
     },
     pages: {
       DataManagerPage,
+      CollaborationPage,
       SettingsPage,
     },
   },

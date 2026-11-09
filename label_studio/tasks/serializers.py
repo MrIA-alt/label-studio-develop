@@ -5,6 +5,7 @@ from collections.abc import MutableMapping
 
 import ujson as json
 from collab import privacy
+from collab.lifecycle import ensure_project_writable, is_archived
 from core.current_request import CurrentContext, get_current_request
 from core.feature_flags import flag_set
 from core.label_config import replace_task_data_undefined_with_config_field
@@ -96,6 +97,7 @@ class PredictionSerializer(ModelSerializer):
             project = data['task'].project
         elif 'project' in data:
             project = data['project']
+        ensure_project_writable(project)
         ff_user = project.organization.created_by if project else 'auto'
 
         if not flag_set('fflag_feat_utc_210_prediction_validation_15082025', user=ff_user):
@@ -150,6 +152,71 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
     created_ago = serializers.CharField(default='', read_only=True, help_text='Time delta from creation time')
     completed_by = serializers.PrimaryKeyRelatedField(required=False, queryset=User.objects.all())
     unique_id = serializers.CharField(required=False, write_only=True)
+    revision = serializers.IntegerField(read_only=True)
+    readonly = serializers.SerializerMethodField()
+
+    def get_readonly(self, annotation) -> bool:
+        if is_archived(annotation.project):
+            return True
+        from collab import reviews
+        from collab.permissions import get_service_account
+
+        request = self.context.get('request')
+        if request is None:
+            return False
+        user = request.user
+        if not getattr(user, 'is_authenticated', False):
+            return True
+        if get_service_account(user) is not None and annotation.completed_by_id != user.pk:
+            return True
+        if privacy.get_policy(annotation.project) is not None and user.get_organization_role() == 'qa':
+            if annotation.completed_by_id != user.pk:
+                return True
+        return (privacy.is_restricted_user(user) or get_service_account(user) is not None) and not reviews.author_edit_allowed(annotation, user)
+
+    def validate(self, data):
+        request = self.context.get('request')
+        from collab.permissions import get_service_account
+
+        if request is not None and self.instance is not None:
+            immutable = {
+                name for name in ('task', 'project', 'completed_by')
+                if name in self.initial_data
+                and str(self.initial_data[name]) != str(getattr(self.instance, name + '_id'))
+            }
+            managed = {
+                'review_status', 'review_comment', 'reviewed_by', 'reviewed_at',
+                'task_assignment', 'updated_by', 'last_created_by', 'last_action',
+            }.intersection(self.initial_data)
+            if immutable or managed:
+                from rest_framework.exceptions import PermissionDenied
+
+                raise PermissionDenied('Annotation ownership and workflow metadata are managed by the server.')
+        if request is not None and (
+            privacy.is_restricted_user(request.user) or get_service_account(request.user) is not None
+        ):
+            protected = {
+                'review_status', 'review_comment', 'reviewed_by', 'reviewed_at', 'task_assignment',
+                'ground_truth', 'updated_by', 'last_created_by', 'last_action',
+            }
+            if self.instance is not None:
+                protected.update(('task', 'project', 'completed_by'))
+            forbidden = protected.intersection(self.initial_data)
+            # The native editor sometimes sends unchanged author/ground-truth fields.
+            if self.initial_data.get('ground_truth') is False and (self.instance is None or not self.instance.ground_truth):
+                forbidden.discard('ground_truth')
+            if self.instance is not None:
+                for name in ('task', 'project', 'completed_by'):
+                    if str(self.initial_data.get(name)) == str(getattr(self.instance, name + '_id')):
+                        forbidden.discard(name)
+            if forbidden:
+                from rest_framework.exceptions import PermissionDenied
+
+                raise PermissionDenied('These annotation fields are managed by the server: ' + ', '.join(sorted(forbidden)))
+            parent = data.get('parent_annotation')
+            if parent is not None and not privacy.can_access_annotation(request.user, parent):
+                raise ValidationError({'parent_annotation': 'The parent annotation is not accessible.'})
+        return super().validate(data)
 
     def create(self, *args, **kwargs):
         try:
@@ -169,12 +236,14 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
         if isinstance(value, str):
             try:
                 data = json.loads(value)
-            except:  # noqa: E722
-                raise ValueError('annotation "result" can\'t be parse from str to JSON')
+            except ValueError:
+                raise ValidationError('annotation "result" must contain valid JSON')
 
         # check result is list
         if not isinstance(data, list):
             raise ValidationError('annotation "result" field in annotation must be list')
+        if any(not isinstance(item, dict) for item in data):
+            raise ValidationError('annotation "result" must be a list of objects')
 
         return data
 
@@ -204,6 +273,7 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
     class Meta:
         model = Annotation
         exclude = ['prediction', 'result_count']
+        read_only_fields = ['task_assignment', 'review_status', 'review_comment', 'reviewed_by', 'reviewed_at', 'revision']
         expandable_fields = {'completed_by': (CompletedByDMSerializer,)}
 
 
@@ -214,6 +284,7 @@ class AnnotationReviewSerializer(serializers.Serializer):
         choices=[Annotation.REVIEW_ACCEPTED, Annotation.REVIEW_REJECTED],
         help_text='Review status: accepted or rejected',
     )
+    revision = serializers.IntegerField(required=False, min_value=1)
     comment = serializers.CharField(
         required=False,
         allow_blank=True,
@@ -251,6 +322,10 @@ class AnnotationStubSerializer(FlexFieldsModelSerializer):
     completed_by = serializers.PrimaryKeyRelatedField(required=False, queryset=User.objects.all())
     # Mark this as a stub so frontend knows to fetch full data on selection
     is_stub = serializers.SerializerMethodField(read_only=True)
+    readonly = serializers.SerializerMethodField()
+
+    def get_readonly(self, annotation) -> bool:
+        return AnnotationSerializer.get_readonly(self, annotation)
 
     def get_created_username(self, annotation) -> str:
         user = annotation.completed_by
@@ -280,10 +355,55 @@ class AnnotationStubSerializer(FlexFieldsModelSerializer):
             'ground_truth',
             'was_cancelled',
             'is_stub',
+            'revision',
+            'readonly',
         ]
 
 
+TASK_COMPUTED_FIELDS = (
+    'is_labeled', 'total_annotations', 'cancelled_annotations', 'total_predictions',
+    'comment_count', 'unresolved_comment_count', 'comment_authors', 'last_comment_updated_at',
+    'updated_by', 'inner_id',
+)
+
+
+def validate_task_source_file(project, data, context):
+    """A source-file reference must stay inside the target project, including bulk import DTOs."""
+    if not isinstance(data, MutableMapping):
+        return
+    for field in ('file_upload', 'file_upload_id'):
+        upload = data.get(field)
+        if upload is None:
+            continue
+        upload_project = getattr(upload, 'project_id', None)
+        if upload_project is None:
+            from data_import.models import FileUpload
+
+            upload_id = serializers.IntegerField(min_value=1).run_validation(upload)
+            # A large file import can contain thousands of tasks referencing the
+            # same upload. Resolve each identifier once per serializer context.
+            cache = context.setdefault('_collab_upload_projects', {})
+            if upload_id not in cache:
+                cache[upload_id] = FileUpload.objects.filter(pk=upload_id).values_list('project_id', flat=True).first()
+            upload_project = cache[upload_id]
+        if project is None or upload_project != project.pk:
+            # The bulk-import error formatter also consumes this validator and
+            # expects a list of errors rather than a mapping of field names.
+            raise ValidationError(f'The uploaded source file ({field}) must belong to this task project.')
+
+
 class TaskSimpleSerializer(FlexFieldsModelSerializer):
+    def validate(self, data):
+        project = data.get('project')
+        ensure_project_writable(self.instance.project if self.instance is not None else project)
+        if self.instance is not None and project is not None and project.pk != self.instance.project_id:
+            raise ValidationError({'project': 'A task cannot be moved by changing its project field.'})
+        project = self.instance.project if self.instance is not None else project
+        validate_task_source_file(project, data, self.context)
+        if privacy.get_policy(project) is not None:
+            data.pop('overlap', None)
+        return super().validate(data)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields['annotations'] = AnnotationSerializer(many=True, default=[], context=self.context, read_only=True)
@@ -299,6 +419,9 @@ class TaskSimpleSerializer(FlexFieldsModelSerializer):
         ret = super().to_representation(instance)
         request = self.context.get('request')
         user = getattr(request, 'user', None)
+        policy = privacy.get_policy(project)
+        if user is not None and privacy.is_restricted_user(user) and policy and not policy.allow_predictions:
+            ret['predictions'] = []
         if project and user is not None and privacy.is_blind_for(user, project):
             privacy.scrub_task_representation(ret, instance, user)
         return ret
@@ -306,6 +429,7 @@ class TaskSimpleSerializer(FlexFieldsModelSerializer):
     class Meta:
         model = Task
         exclude = ('precomputed_agreement', 'allow_skip')
+        read_only_fields = TASK_COMPUTED_FIELDS
 
 
 class BaseTaskSerializer(FlexFieldsModelSerializer):
@@ -328,6 +452,10 @@ class BaseTaskSerializer(FlexFieldsModelSerializer):
         instance = self.instance if hasattr(self, 'instance') else None
 
         project = self.project(task=instance)
+        ensure_project_writable(project)
+        validate_task_source_file(project, task, self.context)
+        if isinstance(task, MutableMapping) and privacy.get_policy(project) is not None:
+            task.pop('overlap', None)
 
         current_request = get_current_request()
         if current_request and current_request.method == 'POST' and not project:
@@ -363,6 +491,7 @@ class BaseTaskSerializer(FlexFieldsModelSerializer):
     class Meta:
         model = Task
         exclude = ('precomputed_agreement', 'allow_skip')
+        read_only_fields = TASK_COMPUTED_FIELDS
 
 
 class BaseTaskSerializerBulk(serializers.ListSerializer):
@@ -511,6 +640,12 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
 
     @retry_database_locked()
     def create(self, validated_data):
+        from fsm.bulk_state_cache import cache_new_entity_states
+
+        with transaction.atomic(), cache_new_entity_states():
+            return self._create_batch(validated_data)
+
+    def _create_batch(self, validated_data):
         """Create Tasks, Annotations, etc in bulk"""
         validated_tasks = validated_data
         logging.info(f'Try to serialize tasks with annotations, data len = {len(validated_data)}')
@@ -714,6 +849,8 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
 
     def add_annotations(self, task_annotations, user):
         """Save task annotations to DB"""
+        from fsm.bulk_state_cache import bulk_create_with_initial_states
+
         db_annotations = []
 
         # add annotations
@@ -750,9 +887,13 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
             for annotation in db_annotations:
                 annotation.id = current_id
                 current_id += 1
-            self.db_annotations = Annotation.objects.bulk_create(db_annotations, batch_size=settings.BATCH_SIZE)
+            self.db_annotations = bulk_create_with_initial_states(
+                Annotation.objects, db_annotations, batch_size=settings.BATCH_SIZE
+            )
         else:
-            self.db_annotations = Annotation.objects.bulk_create(db_annotations, batch_size=settings.BATCH_SIZE)
+            self.db_annotations = bulk_create_with_initial_states(
+                Annotation.objects, db_annotations, batch_size=settings.BATCH_SIZE
+            )
         logging.info(f'Annotations serialization success, len = {len(self.db_annotations)}')
 
         # Backfill FSM states for bulk-created annotations
@@ -763,6 +904,8 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
 
     def add_tasks(self, task_annotations, task_predictions, validated_tasks):
         """Extract tasks from validated_tasks and store them in DB"""
+        from fsm.bulk_state_cache import bulk_create_with_initial_states
+
         db_tasks = []
         max_overlap = self.project.maximum_annotations
 
@@ -804,9 +947,9 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
             for task in db_tasks:
                 task.id = current_id
                 current_id += 1
-            self.db_tasks = Task.objects.bulk_create(db_tasks, batch_size=settings.BATCH_SIZE)
+            self.db_tasks = bulk_create_with_initial_states(Task.objects, db_tasks, batch_size=settings.BATCH_SIZE)
         else:
-            self.db_tasks = Task.objects.bulk_create(db_tasks, batch_size=settings.BATCH_SIZE)
+            self.db_tasks = bulk_create_with_initial_states(Task.objects, db_tasks, batch_size=settings.BATCH_SIZE)
 
         logging.info(f'Tasks serialization success, len = {len(self.db_tasks)}')
 
@@ -878,6 +1021,27 @@ class AnnotationDraftSerializer(ModelSerializer):
     created_username = serializers.SerializerMethodField(default='', read_only=True, help_text='User name string')
     created_ago = serializers.CharField(default='', read_only=True, help_text='Delta time from creation time')
 
+    def validate(self, data):
+        request = self.context.get('request')
+        if request is not None:
+            user = request.user
+            if self.instance is not None:
+                for name in ('task', 'annotation', 'user'):
+                    if name in self.initial_data:
+                        current_id = getattr(self.instance, name + '_id')
+                        if str(self.initial_data[name]) not in {str(current_id), str(getattr(self.instance, name))}:
+                            raise ValidationError({'detail': 'A draft cannot change its owner, task or annotation.'})
+                data.pop('user', None)
+            task = data.get('task') or (self.instance.task if self.instance else None)
+            if task is not None and not privacy.can_access_task(user, task):
+                raise ValidationError({'task': 'The task is not accessible.'})
+            annotation = data.get('annotation')
+            if annotation is not None and (
+                (task is not None and annotation.task_id != task.pk) or not privacy.can_access_annotation(user, annotation)
+            ):
+                raise ValidationError({'annotation': 'The annotation is not accessible for this task.'})
+        return super().validate(data)
+
     def get_created_username(self, draft):
         user = draft.user
         if not user:
@@ -922,6 +1086,9 @@ class TaskWithAnnotationsAndPredictionsAndDraftsSerializer(TaskSerializer):
     def get_predictions(self, task):
         predictions = task.predictions
         user = self._get_user()
+        policy = privacy.get_policy(task.project)
+        if user is not None and privacy.is_restricted_user(user) and policy and not policy.allow_predictions:
+            return []
         if flag_set('ff_front_dev_1682_model_version_dropdown_070622_short', user=user or 'auto'):
             active_ml_backends = task.project.get_active_ml_backends()
             model_versions = active_ml_backends.values_list('model_version', flat=True)
@@ -967,6 +1134,10 @@ class NextTaskSerializer(TaskWithAnnotationsAndPredictionsAndDraftsSerializer):
             return lock.unique_id
 
     def get_predictions(self, task):
+        policy = privacy.get_policy(task.project)
+        user = self.context['request'].user
+        if privacy.is_restricted_user(user) and policy and not policy.allow_predictions:
+            return []
         predictions = task.get_predictions_for_prelabeling()
         return PredictionSerializer(predictions, many=True, read_only=True, default=[], context=self.context).data
 

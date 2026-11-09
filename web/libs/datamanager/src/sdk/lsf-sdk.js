@@ -552,6 +552,8 @@ export class LSFWrapper {
           if (!isAlive(lsfAnnotation) || !isAlive(lsfAnnotation.trackedState)) return fullAnnotation;
           lsfAnnotation.history.freeze();
           lsfAnnotation.deserializeResults(fullAnnotation.result);
+          if (fullAnnotation.revision !== undefined) lsfAnnotation.setRevision(fullAnnotation.revision);
+          if (fullAnnotation.readonly !== undefined) lsfAnnotation.setReadonly(fullAnnotation.readonly);
           // Critical: updateObjects() is required to render visual regions after deserializing
           lsfAnnotation.updateObjects();
           lsfAnnotation.history.safeUnfreeze();
@@ -755,10 +757,9 @@ export class LSFWrapper {
     if (["http:", "https:"].includes(parsedUrl.protocol)) return url;
 
     const api = this.datamanager.api;
-    const projectId = this.project.id;
     const fileuri = btoa(url);
 
-    return api.createUrl(api.endpoints.presignUrlForProject, { projectId, fileuri }).url;
+    return api.createUrl(api.endpoints.presignUrlForTask, { taskID: this.task.id, fileuri }).url;
   };
 
   onStorageInitialized = async (ls) => {
@@ -776,6 +777,11 @@ export class LSFWrapper {
   showOperationToast(status, successMessage, errorAction, result) {
     if (status === 200 || status === 201) {
       this.datamanager.invoke("toast", { message: successMessage, type: "info" });
+    } else if (status === 409) {
+      this.datamanager.invoke("toast", {
+        message: "This annotation changed since you opened it. Your edits are still here. Reload the task before saving a new version.",
+        type: "error",
+      });
     } else if (status !== undefined) {
       // Skip toast for errors that are handled by global modal handlers via display_context
       // These errors bubble up to ApiProvider which shows appropriate modals
@@ -904,6 +910,9 @@ export class LSFWrapper {
     const status = result?.$meta?.status;
 
     this.showOperationToast(status, "Annotation updated successfully", "Annotation is not updated", result);
+    if (status < 400 && result?.revision !== undefined) {
+      annotation.setRevision(result.revision);
+    }
 
     this.datamanager.invoke("updateAnnotation", ls, annotation, result);
 
@@ -1097,53 +1106,21 @@ export class LSFWrapper {
   onUnskipTask = async () => {
     const { task, currentAnnotation } = this;
 
-    if (!isDefined(currentAnnotation) && !isDefined(currentAnnotation.pk)) {
+    if (!isDefined(currentAnnotation) || !isDefined(currentAnnotation.pk)) {
       console.error("Annotation must be on unskip");
       return;
     }
 
-    await this.withinLoadingState(async () => {
+    const converted = await this.withinLoadingState(async () => {
       currentAnnotation.pauseAutosave();
-
-      if (isFF(FF_DEV_3034)) {
-        await this.datamanager.apiCall("convertToDraft", {
-          annotationID: currentAnnotation.pk,
-        });
-      } else {
-        if (currentAnnotation.draftId > 0) {
-          await this.datamanager.apiCall(
-            "updateDraft",
-            {
-              draftID: currentAnnotation.draftId,
-            },
-            {
-              body: { annotation: null },
-            },
-          );
-        } else {
-          const annotationData = { body: this.prepareData(currentAnnotation) };
-
-          await this.datamanager.apiCall(
-            "createDraftForTask",
-            {
-              taskID: this.task.id,
-            },
-            annotationData,
-          );
-        }
-
-        // Carry over any comments to when the annotation draft is eventually submitted
-        if (isFF(FF_DEV_2887) && this.lsf?.commentStore?.toCache) {
-          this.lsf.commentStore.toCache(`task.${task.id}`);
-        }
-
-        await this.datamanager.apiCall("deleteAnnotation", {
-          taskID: task.id,
-          annotationID: currentAnnotation.pk,
-        });
-      }
+      return this.datamanager.apiCall("convertToDraft", { annotationID: currentAnnotation.pk });
     });
+    if (!converted || converted.error || converted.$meta?.status >= 400) return;
     await this.loadTask(task.id);
+    if (converted.retained_annotation_id) {
+      const resumed = this.annotations.find((annotation) => String(annotation.draftId) === String(converted.id));
+      if (resumed) this.lsf.annotationStore.selectAnnotation(resumed.id);
+    }
     this.datamanager.invoke("unskipTask");
   };
 
@@ -1215,6 +1192,7 @@ export class LSFWrapper {
   };
 
   _invokeSelectAnnotation = async (prevAnnotation, nextAnnotation, options) => {
+    if (this.project.is_archived) prevAnnotation?.setReadonly(true);
     // Invoke the DataManager callback first so that history fetch can start immediately.
     // The history endpoint only needs the annotation pk (available on stubs).
     // Hydration (which fetches full annotation data) runs in parallel afterwards.
@@ -1244,7 +1222,7 @@ export class LSFWrapper {
   };
 
   // FIT-720: Hydrate a stub annotation by fetching full data from API
-  _hydrateStubAnnotation = async (annotation) => {
+  async _hydrateStubAnnotation(annotation) {
     // Check if annotation is a stub (no regions/results)
     // Stubs have empty results - check via the areas map which holds deserialized regions
     const hasRegions = annotation.areas?.size > 0;
@@ -1297,6 +1275,8 @@ export class LSFWrapper {
         // Deserialize the results into the annotation
         if (!isAlive(freshAnnotation) || !isAlive(freshAnnotation.trackedState)) return;
         freshAnnotation.deserializeResults(fullAnnotation.result);
+        if (fullAnnotation.revision !== undefined) freshAnnotation.setRevision(fullAnnotation.revision);
+        if (fullAnnotation.readonly !== undefined) freshAnnotation.setReadonly(fullAnnotation.readonly);
 
         // Critical: updateObjects() MUST be called to render visual regions after deserializing
         freshAnnotation.updateObjects?.();
@@ -1311,7 +1291,7 @@ export class LSFWrapper {
     } catch {
       // Failed to hydrate annotation - will show stub state
     }
-  };
+  }
 
   onNextTask = async (nextTaskId, nextAnnotationId) => {
     await this.saveDraft();
@@ -1342,6 +1322,7 @@ export class LSFWrapper {
 
     if (result && result.id !== undefined) {
       const annotationId = result.id.toString();
+      if (result.revision !== undefined) currentAnnotation.setRevision(result.revision);
 
       currentAnnotation.updatePersonalKey(annotationId);
 
@@ -1433,6 +1414,7 @@ export class LSFWrapper {
       parent_annotation: annotation.parent_annotation,
       started_at: startedAt.toISOString(),
     };
+    if (annotation.revision !== undefined) result.revision = annotation.revision;
 
     if (includeId && userGenerate) {
       result.id = Number.parseInt(annotation.pk);

@@ -236,7 +236,6 @@ class MLApi(BaseHTTPAPI):
                 'project': self._create_project_uid(project),
                 'schema': project.label_config,
                 'hostname': settings.HOSTNAME if settings.HOSTNAME else ('http://localhost:' + settings.INTERNAL_PORT),
-                'access_token': project.created_by.auth_token.key,
                 'extra_params': extra_params,
             },
             timeout=TIMEOUT_SETUP,

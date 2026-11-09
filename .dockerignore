@@ -7,6 +7,7 @@
 !deploy/heroku_run.sh
 !deploy/uwsgi.ini
 !deploy/default.conf
+!deploy/prepare_entrypoint.py
 !label_studio/**
 # Re-ignore pyc files and frontend
 label_studio/frontend
@@ -22,5 +23,6 @@ label_studio/**/*.pyc
 !README.md
 !licenses/**
 !LICENSE
+!NOTICE
 !pyproject.toml
 !poetry.lock

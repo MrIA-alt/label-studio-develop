@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { SidebarMenu } from "../../components/SidebarMenu/SidebarMenu";
 import { useAPI } from "../../providers/ApiProvider";
+import { Link, useParams } from "react-router-dom";
 import { WebhookPage } from "../WebhookPage/WebhookPage";
 import { DangerZone } from "./DangerZone";
 import { GeneralSettings } from "./GeneralSettings";
@@ -24,11 +25,10 @@ const allMenuItems = [
   DangerZone,
 ];
 
-const qaMenuItems = [MembersSettings];
-
 export const MenuLayout = ({ children, ...routeProps }) => {
   const api = useAPI();
   const [userRole, setUserRole] = useState(null);
+  const { id } = useParams();
 
   useEffect(() => {
     const fetchRole = async () => {
@@ -38,7 +38,9 @@ export const MenuLayout = ({ children, ...routeProps }) => {
     fetchRole();
   }, []);
 
-  const menuItems = userRole === "qa" ? qaMenuItems : allMenuItems;
+  if (!userRole) return <p role="status">Loading settings…</p>;
+  if (userRole !== "admin") return <div className="campaign-panel"><p>Project settings are managed by an administrator.</p><Link to={`/projects/${id}/collaboration`}>Return to the campaign</Link></div>;
+  const menuItems = allMenuItems;
 
   return (
     <SidebarMenu

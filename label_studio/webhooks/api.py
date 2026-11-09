@@ -6,10 +6,14 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from projects import models as project_models
 from rest_framework import generics
-from rest_framework.exceptions import NotFound
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.settings import api_settings
+from collab.permissions import get_service_account, has_service_scope, scope_queryset_for_service
+from collab.webhooks import validate_target_url
+from collab import audit
 
 from .models import Webhook, WebhookAction
 from .serializers import WebhookSerializer, WebhookSerializerForUpdate
@@ -58,7 +62,7 @@ class WebhookFilterSet(django_filters.FilterSet):
 class WebhookListAPI(generics.ListCreateAPIView):
     queryset = Webhook.objects.all()
     serializer_class = WebhookSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
     filter_backends = [DjangoFilterBackend]
     filterset_class = WebhookFilterSet
     permission_required = ViewClassPermission(
@@ -67,13 +71,20 @@ class WebhookListAPI(generics.ListCreateAPIView):
     )
 
     def get_queryset(self):
-        return Webhook.objects.filter(organization=self.request.user.active_organization)
+        return scope_queryset_for_service(
+            Webhook.objects.filter(organization=self.request.user.active_organization), self.request.user
+        )
 
     def perform_create(self, serializer):
         project = serializer.validated_data.get('project')
-        if project is None or project.organization_id != self.request.user.active_organization.id:
+        if project is None or not project.has_permission(self.request.user):
             raise NotFound('Project not found.')
-        serializer.save(organization=self.request.user.active_organization)
+        validate_target_url(serializer.validated_data['url'])
+        if get_service_account(self.request.user) is not None and serializer.validated_data.get('send_payload', True):
+            if not has_service_scope(self.request.user, 'results:read'):
+                raise PermissionDenied('Full webhook payloads require results:read.')
+        hook = serializer.save(organization=self.request.user.active_organization, approved_by=self.request.user)
+        audit.record(self.request, 'webhook.approve', project, 'webhook', hook.pk)
 
 
 @method_decorator(
@@ -127,7 +138,7 @@ class WebhookListAPI(generics.ListCreateAPIView):
 class WebhookAPI(generics.RetrieveUpdateDestroyAPIView):
     queryset = Webhook.objects.all()
     serializer_class = WebhookSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
     permission_required = ViewClassPermission(
         GET=all_permissions.webhooks_view,
         PATCH=all_permissions.webhooks_change,
@@ -141,7 +152,21 @@ class WebhookAPI(generics.RetrieveUpdateDestroyAPIView):
         return super().get_serializer_class()
 
     def get_queryset(self):
-        return Webhook.objects.filter(organization=self.request.user.active_organization)
+        return scope_queryset_for_service(
+            Webhook.objects.filter(organization=self.request.user.active_organization), self.request.user
+        )
+
+    def perform_update(self, serializer):
+        validate_target_url(serializer.validated_data.get('url', serializer.instance.url))
+        if get_service_account(self.request.user) is not None and serializer.validated_data.get('send_payload', serializer.instance.send_payload):
+            if not has_service_scope(self.request.user, 'results:read'):
+                raise PermissionDenied('Full webhook payloads require results:read.')
+        hook = serializer.save(approved_by=self.request.user)
+        audit.record(self.request, 'webhook.approve', hook.project, 'webhook', hook.pk)
+
+    def perform_destroy(self, instance):
+        audit.record(self.request, 'webhook.delete', instance.project, 'webhook', instance.pk)
+        instance.delete()
 
 
 @method_decorator(

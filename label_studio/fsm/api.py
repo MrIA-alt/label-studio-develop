@@ -13,6 +13,7 @@ from fsm.serializers import (
     FSMTransitionExecuteRequestSerializer,
     FSMTransitionExecuteResponseSerializer,
     StateModelSerializer,
+    can_see_entity_state,
 )
 from fsm.state_manager import get_state_manager
 from fsm.transitions import ModelChangeTransition, TransitionValidationError
@@ -27,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 
 class FSMAPIMixin:
+    @property
+    def permission_required(self):
+        # The shared role and service-scope gates read this attribute.
+        return self.permission_map.get(self.kwargs.get('entity_name'))
+
     def get_permission_required(self):
 
         entity_name = self.kwargs['entity_name']
@@ -104,12 +110,23 @@ class FSMEntityHistoryAPI(FSMAPIMixin, generics.ListAPIView):
     }
 
     def get_queryset(self):
+        from collab import privacy
+
         entity = self.get_entity()
+        self._fsm_entity = entity
         state_manager = get_state_manager()
         qs = state_manager.get_state_history(entity)
         qs = qs.filter(organization_id=self.request.user.active_organization_id)
+        project = entity if self.kwargs['entity_name'] == 'project' else getattr(entity, 'project', None)
+        if self.kwargs['entity_name'] in ('task', 'project') and privacy.is_blind_for(self.request.user, project):
+            # Filtering or paginating global events would itself reveal other
+            # authors' activity, even if their identities were stripped.
+            return qs.none()
         qs = qs.prefetch_related('triggered_by__om_through')
         return qs
+
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), 'entity': getattr(self, '_fsm_entity', None)}
 
     def list(self, request, *args, **kwargs):
         entity_name = kwargs['entity_name']
@@ -152,6 +169,11 @@ class FSMEntityTransitionAPI(FSMAPIMixin, generics.GenericAPIView):
             raise NotFound()
 
         entity = self.get_entity()
+
+        if not can_see_entity_state(request, entity):
+            # A success/failure difference can reveal the global annotation
+            # threshold even when the serialized state record is redacted.
+            raise PermissionDenied('Global state transitions require access to campaign results.')
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -206,6 +228,6 @@ class FSMEntityTransitionAPI(FSMAPIMixin, generics.GenericAPIView):
                 'state_record': state_record,
             }
         return Response(
-            FSMTransitionExecuteResponseSerializer(response_payload, context={'request': request}).data,
+            FSMTransitionExecuteResponseSerializer(response_payload, context={'request': request, 'entity': entity}).data,
             status=status.HTTP_200_OK,
         )

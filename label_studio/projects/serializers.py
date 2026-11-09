@@ -1,7 +1,10 @@
 """This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license.
 """
 import bleach
+from collab import privacy
+from core.current_request import CurrentContext
 from constants import SAFE_HTML_ATTRIBUTES, SAFE_HTML_TAGS
+from django.db import transaction
 from django.db.models import Q
 from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
 from fsm.serializer_fields import FSMStateField
@@ -114,6 +117,34 @@ class ProjectSerializer(FlexFieldsModelSerializer):
     queue_total = serializers.SerializerMethodField()
     queue_done = serializers.SerializerMethodField()
     state = FSMStateField(read_only=True)  # FSM state - automatically uses annotation if present
+    is_archived = serializers.SerializerMethodField()
+
+    def get_is_archived(self, project) -> bool:
+        from collab.lifecycle import is_archived
+
+        return is_archived(project)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) or CurrentContext.get_user()
+        if user is not None and privacy.is_blind_for(user, instance):
+            # Native project counters must not reveal another annotator's work.
+            for name in (
+                'total_annotations_number', 'useful_annotation_number', 'ground_truth_number',
+                'skipped_annotations_number', 'num_tasks_with_annotations', 'finished_task_number',
+                'state',
+            ):
+                data.pop(name, None)
+            visible_tasks = privacy.scope_tasks(instance.tasks.all(), user, instance)
+            data['task_number'] = visible_tasks.count()
+            data['queue_total'] = data['task_number']
+            data['queue_done'] = visible_tasks.filter(
+                annotations__completed_by=user, annotations__was_cancelled=False
+            ).distinct().count()
+        if user is not None and privacy.is_restricted_user(user):
+            data.pop('task_data_login', None)
+        return data
 
     @property
     def user_id(self):
@@ -225,9 +256,12 @@ class ProjectSerializer(FlexFieldsModelSerializer):
             'memberships': {'required': False},
             'title': {'required': False},
             'created_by': {'required': False},
+            'task_data_password': {'write_only': True, 'required': False},
+            'organization': {'read_only': True},
         }
         fields = [
             'id',
+            'is_archived',
             'title',
             'description',
             'label_config',
@@ -303,11 +337,53 @@ class ProjectSerializer(FlexFieldsModelSerializer):
 
         return value
 
+    def validate_maximum_annotations(self, value):
+        if self.instance is None or privacy.get_policy(self.instance) is not None:
+            if not 1 <= value <= 10:
+                raise serializers.ValidationError('Collaborative projects require between 1 and 10 annotations.')
+        return value
+
+    def validate(self, data):
+        from collab.permissions import get_service_account, has_service_scope
+        from rest_framework.exceptions import PermissionDenied
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) or CurrentContext.get_user()
+        policy_fields = {'maximum_annotations', 'overlap_cohort_percentage'}
+        collaborative = self.instance is None or privacy.get_policy(self.instance) is not None
+        if (
+            get_service_account(user) is not None
+            and policy_fields.intersection(data)
+            and collaborative
+            and not has_service_scope(user, 'policy:write')
+        ):
+            raise PermissionDenied('Configuring collaborative annotation counts requires policy:write.')
+        if collaborative and data.get('overlap_cohort_percentage', 100) != 100:
+            raise serializers.ValidationError({
+                'overlap_cohort_percentage': 'Collaborative projects require 100% overlap. Configure the required annotation count instead.',
+            })
+        return super().validate(data)
+
     def update(self, instance, validated_data):
+        from collab import audit, webhooks
+        from collab.lifecycle import ensure_project_writable
+
         if validated_data.get('show_collab_predictions') is False:
             instance.model_version = ''
 
-        return super().update(instance, validated_data)
+        with transaction.atomic():
+            published_before = Project.objects.select_for_update().values_list('is_published', flat=True).get(pk=instance.pk)
+            ensure_project_writable(instance)
+            instance = super().update(instance, validated_data)
+            if 'maximum_annotations' in validated_data and privacy.get_policy(instance) is not None:
+                from collab.api import apply_policy
+
+                apply_policy(instance, {'required_annotations': validated_data['maximum_annotations']}, partial=True)
+            if validated_data.get('is_published') and not published_before:
+                actor = self.context.get('request') or CurrentContext.get_user()
+                audit.record(actor, 'project.publish', instance, 'project', instance.pk)
+                webhooks.emit(instance, 'project.published', {})
+        return instance
 
     def get_queue_total(self, project) -> int:
         remain = project.tasks.filter(
@@ -362,6 +438,15 @@ class ProjectLabelConfigSerializer(serializers.Serializer):
 
 
 class ProjectSummarySerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) or CurrentContext.get_user()
+        if user is not None and privacy.is_blind_for(user, instance.project):
+            for name in ('created_annotations', 'created_labels', 'created_labels_drafts'):
+                data[name] = {}
+        return data
+
     class Meta:
         model = ProjectSummary
         fields = '__all__'

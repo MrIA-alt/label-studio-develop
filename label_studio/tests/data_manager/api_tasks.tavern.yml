@@ -4,7 +4,8 @@ strict: false
 marks:
   - usefixtures:
       - django_live_url
-  - skipif: "'default' not in '{tavern.env_vars.DJANGO_DB}'"
+      - native_project_workflow
+  - skipif: "'{tavern.env_vars.DJANGO_DB}' not in ('default', 'postgresql')"
 stages:
 
   - id: signup
@@ -104,48 +105,6 @@ stages:
         {
           "cancelled_annotations": 0,
           "storage_filename": null,
-          "annotations_results": "",
-          "data": {
-            "text": "opop",
-            "int_field": 42
-          },
-
-          "predictions_results": !raw "[{type:choices, value:{choices:[class_PREDICTIONS_TESTING]}, to_name:text, from_name:text_class}]",
-          "predictions_score": null,
-          "total_annotations": 0,
-          "total_predictions": 1,
-          "annotations_ids": "",
-          "annotations": [],
-          "predictions": [
-          {
-            "model_version": "undefined",
-            "created_ago": "0\u00a0minutes",
-            "result": [
-            {
-              "type": "choices",
-              "value": {
-                "choices": [
-                  "class_PREDICTIONS_TESTING"
-                ]
-              },
-              "to_name": "text",
-              "from_name": "text_class"
-            }
-            ],
-            "score": null,
-            "cluster": null,
-            "neighbors": null,
-            "mislabeling": 0.0
-          }
-          ],
-          "drafts": [],
-          "annotators": [],
-          "avg_lead_time": null
-
-        },
-        {
-          "cancelled_annotations": 0,
-          "storage_filename": null,
           "annotations_results": !raw "[{type:choices, value:{choices:[class_A]}, to_name:text, from_name:text_class}]",
           "data": {
             "text": "Test example phrase 1",
@@ -207,6 +166,48 @@ stages:
             !int "{created_by}"
           ],
           "avg_lead_time": 3.0
+        },
+        {
+          "cancelled_annotations": 0,
+          "storage_filename": null,
+          "annotations_results": "",
+          "data": {
+            "text": "opop",
+            "int_field": 42
+          },
+
+          "predictions_results": !raw "[{type:choices, value:{choices:[class_PREDICTIONS_TESTING]}, to_name:text, from_name:text_class}]",
+          "predictions_score": null,
+          "total_annotations": 0,
+          "total_predictions": 1,
+          "annotations_ids": "",
+          "annotations": [],
+          "predictions": [
+          {
+            "model_version": "undefined",
+            "created_ago": "0\u00a0minutes",
+            "result": [
+            {
+              "type": "choices",
+              "value": {
+                "choices": [
+                  "class_PREDICTIONS_TESTING"
+                ]
+              },
+              "to_name": "text",
+              "from_name": "text_class"
+            }
+            ],
+            "score": null,
+            "cluster": null,
+            "neighbors": null,
+            "mislabeling": 0.0
+          }
+          ],
+          "drafts": [],
+          "annotators": [],
+          "avg_lead_time": null
+
         },
         {
           "cancelled_annotations": 0,
@@ -342,9 +343,10 @@ stages:
 test_name: tasks-all-fields-sqlite
 strict: false
 marks:
-  - skipif: "'default' in '{tavern.env_vars.DJANGO_DB}'"
+  - skipif: "'{tavern.env_vars.DJANGO_DB}' in ('default', 'postgresql')"
   - usefixtures:
       - django_live_url
+      - native_project_workflow
 stages:
 
   - id: signup
@@ -1130,6 +1132,7 @@ strict: false
 marks:
   - usefixtures:
       - django_live_url
+      - native_project_workflow
 stages:
 
   - id: signup

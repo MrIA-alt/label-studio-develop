@@ -94,11 +94,19 @@ def custom_exception_handler(exc, context):
         # Skipping Sentry for non-500 unhandled exceptions
         sentry_skip = True
 
-    logger.error(
-        '{} {}'.format(exception_id, exc),
-        exc_info=True,
-        extra={'sentry_skip': sentry_skip, 'exception_id': exception_id},
-    )
+    if settings.DEBUG:
+        logger.error('%s %s', exception_id, exc, exc_info=True,
+                     extra={'sentry_skip': sentry_skip, 'exception_id': exception_id})
+    else:
+        # Exception messages may contain credentials or private annotation data.
+        # Keep a diagnostic location and reference without logging arbitrary values.
+        logger.error('%s %s', exception_id, type(exc).__name__, extra={
+            'sentry_skip': sentry_skip, 'exception_id': exception_id,
+            'error_locations': [
+                {'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
+                for frame in tb.extract_tb(exc.__traceback__)
+            ],
+        })
 
     exc = _override_exceptions(exc)
 
@@ -135,12 +143,13 @@ def custom_exception_handler(exc, context):
         if sentry_sdk_loaded:
             # pass exception to sentry
             set_tag('exception_id', exception_id)
-            capture_exception(exc)
+            capture_exception(exc if settings.DEBUG else RuntimeError(type(exc).__name__))
 
         exc_tb = tb.format_exc()
-        logger.debug(exc_tb)
+        if settings.DEBUG:
+            logger.debug(exc_tb)
         response_data['detail'] = str(exc)
-        if not settings.DEBUG_MODAL_EXCEPTIONS:
+        if not (settings.DEBUG and settings.DEBUG_MODAL_EXCEPTIONS):
             exc_tb = None
         response_data['exc_info'] = exc_tb
         # Thrown by sdk when label config is invalid
@@ -150,6 +159,13 @@ def custom_exception_handler(exc, context):
         else:
             response = Response(status=status.HTTP_500_INTERNAL_SERVER_ERROR, data=response_data)
 
+    if response.status_code >= 500 and not settings.DEBUG:
+        response.data = {
+            'id': exception_id, 'status_code': response.status_code,
+            'version': label_studio.__version__, 'code': 'internal_error',
+            'detail': 'An unexpected error occurred. Use the error reference to contact your administrator.',
+            'errors': {}, 'exc_info': None,
+        }
     return response
 
 

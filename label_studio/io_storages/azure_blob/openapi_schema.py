@@ -26,7 +26,6 @@ _azure_blob_import_storage_schema = {
         'presign_ttl': {'type': 'integer', 'description': 'Presign TTL in minutes', 'default': 1},
         **_common_storage_schema_properties,
     },
-    'required': [],
 }
 
 # Azure Blob import storage schema with ID
@@ -36,7 +35,6 @@ _azure_blob_import_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_azure_blob_import_storage_schema['properties'],
     },
-    'required': [],
 }
 
 # Azure Blob export storage schema
@@ -46,7 +44,6 @@ _azure_blob_export_storage_schema = {
         'can_delete_objects': {'type': 'boolean', 'description': 'Deletion from storage enabled', 'default': False},
         **_common_storage_schema_properties,
     },
-    'required': [],
 }
 
 # Azure Blob export storage schema with ID
@@ -56,5 +53,4 @@ _azure_blob_export_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_azure_blob_export_storage_schema['properties'],
     },
-    'required': [],
 }

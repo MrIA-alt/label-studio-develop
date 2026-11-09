@@ -24,7 +24,6 @@ _redis_import_storage_schema = {
         },
         **_common_redis_storage_schema_properties,
     },
-    'required': [],
 }
 
 # Redis import storage schema with ID
@@ -34,7 +33,6 @@ _redis_import_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_redis_import_storage_schema['properties'],
     },
-    'required': [],
 }
 
 # Redis export storage schema
@@ -45,7 +43,6 @@ _redis_export_storage_schema = {
         'can_delete_objects': {'type': 'boolean', 'description': 'Deletion from storage enabled.', 'default': False},
         **_common_redis_storage_schema_properties,
     },
-    'required': [],
 }
 
 # Redis export storage schema with ID
@@ -55,5 +52,4 @@ _redis_export_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_redis_export_storage_schema['properties'],
     },
-    'required': [],
 }

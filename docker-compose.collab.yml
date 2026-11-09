@@ -1,0 +1,123 @@
+name: label-studio-collab
+
+x-app: &app
+  image: ${COLLAB_IMAGE:-label-studio-collab:local}
+  build:
+    context: .
+    args:
+      INCLUDE_DEV: ${COLLAB_TEST_DEPS:-false}
+  environment: &environment
+    DJANGO_SETTINGS_MODULE: core.settings.label_studio
+    DJANGO_DB: postgresql
+    POSTGRE_NAME: collab
+    POSTGRE_USER: collab
+    POSTGRE_PASSWORD: ${POSTGRE_PASSWORD:?Set POSTGRE_PASSWORD in an environment file}
+    POSTGRE_HOST: db
+    POSTGRE_PORT: "5432"
+    BASE_DATA_DIR: /label-studio/data
+    LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+    LABEL_STUDIO_HOST: ${LABEL_STUDIO_HOST:-http://localhost:18080}
+    SECRET_KEY: ${SECRET_KEY:?Set a persistent random SECRET_KEY in an environment file}
+    COLLECT_ANALYTICS: "0"
+    LATEST_VERSION_CHECK: "0"
+    SENTRY_DSN: ""
+    FRONTEND_SENTRY_DSN: ""
+    EMAIL_BACKEND: ${EMAIL_BACKEND:-django.core.mail.backends.dummy.EmailBackend}
+    EMAIL_HOST: ${EMAIL_HOST:-localhost}
+    EMAIL_PORT: ${EMAIL_PORT:-587}
+    EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+    EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
+    EMAIL_USE_TLS: ${EMAIL_USE_TLS:-true}
+    EMAIL_USE_SSL: ${EMAIL_USE_SSL:-false}
+    DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:-Label Studio <noreply@example.invalid>}
+    M365_TENANT_ID: ${M365_TENANT_ID:-}
+    M365_CLIENT_ID: ${M365_CLIENT_ID:-}
+    M365_CLIENT_SECRET: ${M365_CLIENT_SECRET:-}
+    JSON_LOG: "1"
+  volumes:
+    - app-data:/label-studio/data
+    - static-build:/label-studio/label_studio/core/static_build
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: collab
+      POSTGRES_USER: collab
+      POSTGRES_PASSWORD: ${POSTGRE_PASSWORD:?Set POSTGRE_PASSWORD in an environment file}
+    ports:
+      - "127.0.0.1:${COLLAB_POSTGRES_PORT:-55439}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collab -d collab"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *app
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: label-studio-migrate
+
+  app:
+    <<: *app
+    restart: unless-stopped
+    environment:
+      <<: *environment
+      SKIP_DB_MIGRATIONS: "true"
+      UWSGI_PROCESSES: ${UWSGI_PROCESSES:-2}
+      UWSGI_MIN_PROCESSES: ${UWSGI_MIN_PROCESSES:-1}
+      UWSGI_INITIAL_PROCESSES: ${UWSGI_INITIAL_PROCESSES:-2}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: label-studio-uwsgi
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  nginx:
+    <<: *app
+    restart: unless-stopped
+    environment:
+      <<: *environment
+      APP_HOST: app
+    command: nginx
+    ports:
+      - "127.0.0.1:${COLLAB_HTTP_PORT:-18080}:8085"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8085/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  maintenance:
+    <<: *app
+    restart: unless-stopped
+    entrypoint: ["python", "/label-studio/label_studio/manage.py"]
+    command: ["collab_worker", "--interval", "30"]
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib,time; p=pathlib.Path('/tmp/collab-worker-health'); raise SystemExit(0 if p.exists() and time.time()-p.stat().st_mtime<180 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  postgres-data:
+  app-data:
+  static-build:

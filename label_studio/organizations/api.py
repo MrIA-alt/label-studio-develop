@@ -20,6 +20,7 @@ from organizations.serializers import (
     OrganizationMemberRoleSerializer,
     OrganizationMemberSerializer,
     OrganizationSerializer,
+    scope_member_annotations,
 )
 from projects.models import Project
 from rest_framework import generics, status
@@ -140,7 +141,9 @@ class OrganizationMemberListAPI(generics.ListAPIView):
         members = self.paginated_members
         user_ids = [member.user_id for member in members]
         projects = (
-            Project.objects.filter(created_by_id__in=user_ids, organization=self.request.user.active_organization)
+            Project.objects.for_user(self.request.user).filter(
+                created_by_id__in=user_ids, organization=self.request.user.active_organization
+            )
             .values('created_by_id', 'id', 'title')
             .distinct()
         )
@@ -157,11 +160,13 @@ class OrganizationMemberListAPI(generics.ListAPIView):
     def _get_contributed_to_projects_map(self):
         members = self.paginated_members
         user_ids = [member.user_id for member in members]
-        org_project_ids = Project.objects.filter(organization=self.request.user.active_organization).values_list(
-            'id', flat=True
-        )
         annotations = (
-            Annotation.objects.filter(completed_by__in=list(user_ids), project__in=list(org_project_ids))
+            scope_member_annotations(
+                Annotation.objects.filter(
+                    completed_by__in=user_ids, project__organization=self.request.user.active_organization
+                ),
+                self.request.user,
+            )
             .values('completed_by', 'project_id')
             .distinct()
         )
@@ -490,7 +495,7 @@ class OrganizationResetTokenAPI(APIView):
     def post(self, request, *args, **kwargs):
         org = request.user.active_organization
         org.reset_token()
-        logger.debug(f'New token for organization {org.pk} is {org.token}')
+        logger.debug('Reset invitation token for organization %s', org.pk)
         invite_url = '{}?token={}'.format(reverse('user-signup'), org.token)
         serializer = OrganizationInviteSerializer(data={'invite_url': invite_url, 'token': org.token})
         serializer.is_valid()

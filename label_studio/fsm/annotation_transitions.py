@@ -48,6 +48,10 @@ class AnnotationCreatedTransition(ModelChangeTransition):
         Then updates project state based on task completion status.
         Handles "cold start" scenarios where task may not have state record yet.
         """
+        from fsm.functions import sync_collaborative_task_state
+
+        if sync_collaborative_task_state(context.entity.task, user=context.current_user):
+            return
         from fsm.project_transitions import update_project_state_after_task_change
         from fsm.state_choices import TaskStateChoices
         from fsm.state_manager import StateManager
@@ -107,4 +111,6 @@ class AnnotationUpdatedTransition(ModelChangeTransition):
 
     def post_transition_hook(self, context: TransitionContext, state_record: StateModelType) -> None:
         """Post-transition hook for annotation updates."""
-        pass
+        from fsm.functions import sync_collaborative_task_state
+
+        sync_collaborative_task_state(context.entity.task, user=context.current_user)

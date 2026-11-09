@@ -44,6 +44,7 @@ from .utils import (
     redis_client_mock,
     register_ml_backend_mock,
     signin,
+    use_native_project_workflow,
 )
 
 boto3.set_stream_logger('botocore.credentials', logging.DEBUG)
@@ -487,7 +488,7 @@ def project_choices():
     return {'label_config': label, 'title': 'test'}
 
 
-def setup_project(client, project_template, do_auth=True, legacy_api_tokens_enabled=False):
+def setup_project(client, project_template, do_auth=True, legacy_api_tokens_enabled=False, native_workflow=True):
     """Create new test@gmail.com user, login via client, create test project.
     Project configs are thrown over params and automatically grabs from functions names started with 'project_'
 
@@ -526,6 +527,8 @@ def setup_project(client, project_template, do_auth=True, legacy_api_tokens_enab
 
         # get project id and prepare url
         project = Project.objects.filter(title=project_config['title']).first()
+        if native_workflow:
+            use_native_project_workflow(project, project_config.get('maximum_annotations', 1))
         urls.set_project(project.pk)
         print('Project id:', project.id)
 
@@ -674,6 +677,25 @@ def configured_project(business_client, annotator_client):
 @pytest.fixture(name='django_live_url')
 def get_server_url(live_server):
     yield live_server.url
+
+
+@pytest.fixture
+def native_project_workflow(monkeypatch):
+    """Opt individual Tavern compatibility cases into the historical workflow.
+
+    These cases exercise Community imports and Data Manager, rather than the
+    collaborative defaults of newly created production projects.
+    """
+    from projects.api import ProjectListAPI
+
+    perform_create = ProjectListAPI.perform_create
+
+    def create_native_project(view, serializer):
+        maximum_annotations = serializer.validated_data.get('maximum_annotations', 1)
+        perform_create(view, serializer)
+        use_native_project_workflow(serializer.instance, maximum_annotations)
+
+    monkeypatch.setattr(ProjectListAPI, 'perform_create', create_native_project)
 
 
 @pytest.fixture(name='ff_front_dev_1682_model_version_dropdown_070622_short_off', autouse=True)

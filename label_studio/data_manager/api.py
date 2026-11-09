@@ -32,6 +32,8 @@ from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from collab import privacy
+from collab.lifecycle import is_archived
 from tasks.models import Annotation, Prediction, Task
 
 logger = logging.getLogger(__name__)
@@ -234,7 +236,7 @@ class ViewAPI(viewsets.ModelViewSet):
         return Response(status=200)
 
     def get_queryset(self):
-        return View.objects.filter(project__organization=self.request.user.active_organization).order_by('order', 'id')
+        return View.objects.filter(project__in=Project.objects.for_user(self.request.user)).order_by('order', 'id')
 
 
 class TaskPagination(PageNumberPagination):
@@ -249,7 +251,9 @@ class TaskPagination(PageNumberPagination):
         predictions_count_qs = Prediction.objects.filter(task_id__in=queryset)
         self.total_predictions = await sync_to_async(predictions_count_qs.count, thread_sensitive=True)()
 
-        annotations_count_qs = Annotation.objects.filter(task_id__in=queryset, was_cancelled=False)
+        annotations_count_qs = privacy.scope_task_annotations(
+            Annotation.objects.filter(task_id__in=queryset, was_cancelled=False), request.user
+        )
         self.total_annotations = await sync_to_async(annotations_count_qs.count, thread_sensitive=True)()
         # Use .only('id') to avoid loading heavy task.data fields during pagination
         # Full task objects are loaded later with proper annotations
@@ -258,7 +262,9 @@ class TaskPagination(PageNumberPagination):
 
     def sync_paginate_queryset(self, queryset, request, view=None):
         self.total_predictions = Prediction.objects.filter(task_id__in=queryset).count()
-        self.total_annotations = Annotation.objects.filter(task_id__in=queryset, was_cancelled=False).count()
+        self.total_annotations = privacy.scope_task_annotations(
+            Annotation.objects.filter(task_id__in=queryset, was_cancelled=False), request.user
+        ).count()
         # Use .only('id') to avoid loading heavy task.data fields during pagination
         # Full task objects are loaded later with proper annotations
         id_only_queryset = queryset.only('id')
@@ -269,7 +275,9 @@ class TaskPagination(PageNumberPagination):
             total_annotations=Coalesce(Sum('total_annotations'), 0),
             total_predictions=Coalesce(Sum('total_predictions'), 0),
         )
-        self.total_annotations = totals['total_annotations']
+        self.total_annotations = privacy.scope_task_annotations(
+            Annotation.objects.filter(task_id__in=queryset, was_cancelled=False), request.user
+        ).count()
         self.total_predictions = totals['total_predictions']
         # Use .only('id') to avoid loading heavy task.data fields during pagination
         # Full task objects are loaded later with proper annotations
@@ -362,7 +370,7 @@ class TaskListAPI(generics.ListCreateAPIView):
         view_pk = int_from_request(request.GET, 'view', 0) or int_from_request(request.data, 'view', 0)
         project_pk = int_from_request(request.GET, 'project', 0) or int_from_request(request.data, 'project', 0)
         if project_pk:
-            project = generics.get_object_or_404(Project, pk=project_pk)
+            project = generics.get_object_or_404(Project.objects.for_user(request.user), pk=project_pk)
             self.check_object_permissions(request, project)
         elif view_pk:
             view = generics.get_object_or_404(View, pk=view_pk)
@@ -401,7 +409,7 @@ class TaskListAPI(generics.ListCreateAPIView):
             page = [tasks_by_ids[_id] for _id in ids]
 
             # retrieve ML predictions if tasks don't have them
-            if not review and project.evaluate_predictions_automatically:
+            if not review and project.evaluate_predictions_automatically and not is_archived(project):
                 # TODO MM TODO this needs a discussion, because I'd expect
                 # people to retrieve manually instead on DM load, plus it
                 # will slow down initial DM load
@@ -414,7 +422,7 @@ class TaskListAPI(generics.ListCreateAPIView):
             serializer = self.task_serializer_class(page, many=True, context=context)
             return self.get_paginated_response(serializer.data)
         # all tasks
-        if project.evaluate_predictions_automatically:
+        if project.evaluate_predictions_automatically and not is_archived(project):
             evaluate_predictions(queryset.filter(predictions__isnull=True))
         queryset = Task.prepared.annotate_queryset(
             queryset, fields_for_evaluation=fields_for_evaluation, all_fields=all_fields, request=request
@@ -488,7 +496,7 @@ class ProjectColumnsAPI(APIView):
 
     def get(self, request):
         pk = int_from_request(request.GET, 'project', 1)
-        project = generics.get_object_or_404(Project, pk=pk)
+        project = generics.get_object_or_404(Project.objects.for_user(request.user), pk=pk)
         self.check_object_permissions(request, project)
         GET_ALL_COLUMNS = load_func(settings.DATA_MANAGER_GET_ALL_COLUMNS)
         data = GET_ALL_COLUMNS(project, request.user)
@@ -511,19 +519,26 @@ class ProjectStateAPI(APIView):
 
     def get(self, request):
         pk = int_from_request(request.GET, 'project', 1)  # replace 1 to None, it's for debug only
-        project = generics.get_object_or_404(Project, pk=pk)
+        project = generics.get_object_or_404(Project.objects.for_user(request.user), pk=pk)
         self.check_object_permissions(request, project)
-        data = ProjectSerializer(project).data
+        data = ProjectSerializer(project, context={'request': request}).data
+        from collab.permissions import get_service_account, has_service_scope
+
+        tasks = privacy.scope_tasks(project.tasks.all(), request.user, project)
+        annotations = privacy.scope_task_annotations(Annotation.objects.filter(task__in=tasks), request.user)
+        writable = not is_archived(project)
+        admin = request.user.get_organization_role() == 'admin'
+        service = get_service_account(request.user) is not None
 
         data.update(
             {
-                'can_delete_tasks': True,
-                'can_manage_annotations': True,
-                'can_manage_tasks': True,
+                'can_delete_tasks': writable and (has_service_scope(request.user, 'tasks:delete') if service else admin),
+                'can_manage_annotations': writable and (has_service_scope(request.user, 'annotations:delete') if service else admin),
+                'can_manage_tasks': writable and (has_service_scope(request.user, 'imports:write') if service else admin),
                 'source_syncing': False,
                 'target_syncing': False,
-                'task_count': project.tasks.count(),
-                'annotation_count': Annotation.objects.filter(project=project).count(),
+                'task_count': tasks.count(),
+                'annotation_count': annotations.count(),
                 'config_has_control_tags': len(project.get_parsed_config()) > 0
                 or (project.label_config and '<Microphone' in project.label_config),
             }

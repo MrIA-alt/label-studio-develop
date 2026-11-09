@@ -28,6 +28,7 @@ def test_columns_api_returns_expected_ids(business_client):
         'id',
         'inner_id',
         'completed_at',
+        'reviewed',
         'total_annotations',
         'cancelled_annotations',
         'total_predictions',

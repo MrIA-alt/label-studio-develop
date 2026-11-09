@@ -24,9 +24,11 @@ export const MembersSettings = () => {
     if (!project?.id) return;
     setLoading(true);
 
+    const currentUser = await api.callApi("me");
+
     const [membersRes, projectMembersRes] = await Promise.all([
       api.callApi("memberships", {
-        params: { pk: 1, page_size: -1 },
+        params: { pk: currentUser.active_organization, page_size: 500 },
       }),
       api.callApi("projectMembers", {
         params: { pk: project.id },

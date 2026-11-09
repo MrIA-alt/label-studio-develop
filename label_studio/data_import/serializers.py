@@ -13,6 +13,18 @@ class ImportApiSerializer(TaskSerializer):
     annotations = AnnotationSerializer(many=True, default=[])
     predictions = PredictionSerializer(many=True, default=[])
 
+    def validate(self, data):
+        from collab.permissions import get_service_account
+
+        request = self.context.get('request')
+        user = self.context.get('user') or getattr(request, 'user', None)
+        if get_service_account(user) is not None and any(data.get(name) for name in ('annotations', 'drafts', 'reviews')):
+            # The native bulk importer formats a list of item errors.
+            raise serializers.ValidationError(
+                'Service imports contain source data only. Submit results as the authenticated author through the annotation API.'
+            )
+        return super().validate(data)
+
     class Meta:
         model = Task
         list_serializer_class = TaskSerializerBulk

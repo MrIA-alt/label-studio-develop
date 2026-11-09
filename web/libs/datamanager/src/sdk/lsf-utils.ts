@@ -74,6 +74,7 @@ export const annotationToServer = (annotation: LSFAnnotation): APIAnnotation => 
 export const getAnnotationSnapshot = (c: LSFAnnotation) => ({
   id: c.id,
   pk: c.pk,
+  revision: c.revision,
   result: c.serializeAnnotation(),
   leadTime: c.leadTime,
   userGenerate: !!c.userGenerate,

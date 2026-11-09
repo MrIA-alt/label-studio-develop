@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1
+ARG COLLAB_BASE_IMAGE=label-studio-collab:2026-11-06
+ARG NODE_VERSION=22
+ARG PYTHON_VERSION=3.12
+ARG POETRY_VERSION=2.3.2
+ARG VERSION_OVERRIDE
+ARG BRANCH_OVERRIDE
+
+################################ Overview
+
+# This Dockerfile builds a Label Studio environment.
+# It consists of five main stages:
+# 1. "frontend-builder" - Compiles the frontend assets using Node.
+# 2. "frontend-version-generator" - Generates version files for frontend sources.
+# 3. "venv-builder" - Prepares the virtualenv environment.
+# 4. "py-version-generator" - Generates version files for python sources.
+# 5. "prod" - Creates the final production image with the Label Studio, Nginx, and other dependencies.
+
+################################ Stage: frontend-builder (build frontend assets)
+FROM --platform=${BUILDPLATFORM} node:${NODE_VERSION}-alpine AS frontend-builder
+ENV BUILD_NO_SERVER=true \
+    BUILD_NO_HASH=true \
+    BUILD_NO_CHUNKS=true \
+    BUILD_MODULE=true \
+    YARN_CACHE_FOLDER=/root/web/.yarn \
+    NX_CACHE_DIRECTORY=/root/web/.nx \
+    NODE_ENV=production \
+    CYPRESS_INSTALL_BINARY=0 \
+    NODE_OPTIONS="--max-old-space-size=4096"
+
+WORKDIR /label-studio/web
+
+RUN apk add --no-cache \
+    build-base \
+    pkgconfig \
+    cairo-dev \
+    giflib-dev \
+    libjpeg-turbo-dev \
+    libpng-dev \
+    pango-dev \
+    git \
+    python3
+
+COPY web/package.json .
+COPY web/yarn.lock .
+COPY web/tools tools
+RUN --mount=type=cache,target=/root/web/.yarn,id=yarn-cache,sharing=locked \
+    --mount=type=cache,target=/root/web/.nx,id=nx-cache,sharing=locked \
+    yarn install --prefer-offline --no-progress --pure-lockfile --frozen-lockfile --ignore-engines --non-interactive --production=false --network-timeout 300000 --network-concurrency 4
+
+COPY web/ .
+COPY pyproject.toml ../pyproject.toml
+RUN --mount=type=cache,target=/root/web/.yarn,id=yarn-cache,sharing=locked \
+    --mount=type=cache,target=/root/web/.nx,id=nx-cache,sharing=locked \
+    yarn run build
+
+################################ Stage: frontend-version-generator
+FROM frontend-builder AS frontend-version-generator
+RUN --mount=type=cache,target=/root/web/.yarn,id=yarn-cache,sharing=locked \
+    --mount=type=cache,target=/root/web/.nx,id=nx-cache,sharing=locked \
+    --mount=type=bind,source=.git,target=../.git \
+    yarn version:libs
+
+# Incremental application update: dependencies must match the validated base.
+FROM ${COLLAB_BASE_IMAGE} AS production
+USER root
+RUN --mount=type=bind,source=pyproject.toml,target=/tmp/current-pyproject,readonly \
+    --mount=type=bind,source=poetry.lock,target=/tmp/current-lock,readonly \
+    python -c "from pathlib import Path; assert Path('/tmp/current-pyproject').read_bytes()==Path('/label-studio/pyproject.toml').read_bytes(); assert Path('/tmp/current-lock').read_bytes()==Path('/label-studio/poetry.lock').read_bytes(), 'Rebuild dependencies with the full Dockerfile first'"
+COPY --chown=1001:0 label_studio /label-studio/label_studio
+COPY --chown=1001:0 deploy/default.conf /etc/nginx/nginx.conf
+COPY --chown=1001:0 deploy/docker-entrypoint.sh /label-studio/deploy/docker-entrypoint.sh
+COPY --chown=1001:0 deploy/docker-entrypoint.d /label-studio/deploy/docker-entrypoint.d
+COPY --chown=1001:0 deploy/uwsgi.ini /label-studio/deploy/uwsgi.ini
+COPY --chown=1001:0 deploy/prepare_entrypoint.py /label-studio/deploy/prepare_entrypoint.py
+COPY --chown=1001:0 NOTICE /label-studio/NOTICE
+RUN python /label-studio/deploy/prepare_entrypoint.py
+COPY --chown=1001:0 --from=frontend-builder /label-studio/web/dist /label-studio/web/dist
+COPY --chown=1001:0 --from=frontend-version-generator /label-studio/web/dist/apps/labelstudio/version.json /label-studio/web/dist/apps/labelstudio/version.json
+COPY --chown=1001:0 --from=frontend-version-generator /label-studio/web/dist/libs/editor/version.json /label-studio/web/dist/libs/editor/version.json
+COPY --chown=1001:0 --from=frontend-version-generator /label-studio/web/dist/libs/datamanager/version.json /label-studio/web/dist/libs/datamanager/version.json
+USER 1001

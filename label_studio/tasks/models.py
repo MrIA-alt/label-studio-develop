@@ -29,7 +29,7 @@ from data_import.models import FileUpload
 from data_manager.managers import PreparedTaskManager, TaskManager
 from django.conf import settings
 from django.db import OperationalError, models, transaction
-from django.db.models import CheckConstraint, F, JSONField, Q
+from django.db.models import CheckConstraint, Count, F, JSONField, Q
 from django.db.models.lookups import GreaterThanOrEqual
 from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 from django.dispatch import Signal, receiver
@@ -297,7 +297,14 @@ class Task(TaskMixin, FsmHistoryStateModel):
         q = self.get_lock_exclude_query(user)
 
         num_locks = self.num_locks_user(user=user)
-        num_annotations = self.annotations.exclude(q).count()
+        from collab.privacy import get_policy
+
+        if get_policy(self.project) is not None:
+            num_annotations = self.annotations.filter(
+                was_cancelled=False, ground_truth=False, completed_by__isnull=False
+            ).values('completed_by_id').distinct().count()
+        else:
+            num_annotations = self.annotations.exclude(q).count()
         num = num_locks + num_annotations
 
         if num > self.overlap_with_agreement_threshold(num, num_locks):
@@ -329,6 +336,11 @@ class Task(TaskMixin, FsmHistoryStateModel):
         return self.locks.filter(expire_at__gt=now()).count()
 
     def overlap_with_agreement_threshold(self, num, num_locks):
+        from collab.privacy import get_policy
+
+        policy = get_policy(self.project)
+        if policy is not None:
+            return policy.required_annotations
         # Limit to one extra annotator at a time when the task is under the threshold and meets the overlap criteria,
         # regardless of the max_additional_annotators_assignable setting. This ensures recalculating agreement after
         # each annotation and prevents concurrent annotations from dropping the agreement below the threshold.
@@ -373,7 +385,11 @@ class Task(TaskMixin, FsmHistoryStateModel):
         from projects.functions.next_task import get_next_task_logging_level
 
         num_locks = self.num_locks
-        if num_locks < self.overlap:
+        from collab.privacy import get_policy
+
+        policy = get_policy(self.project)
+        overlap = policy.required_annotations if policy else self.overlap
+        if num_locks < overlap:
             lock_ttl = settings.TASK_LOCK_TTL
             if (
                 flag_set('fflag_feat_all_leap_1534_custom_task_lock_timeout_short', user=user)
@@ -528,6 +544,12 @@ class Task(TaskMixin, FsmHistoryStateModel):
         self.annotations.exclude(id=annotation_id).update(ground_truth=False)
 
     def save(self, *args, update_fields=None, **kwargs):
+        if self._state.adding and self.project_id:
+            from collab.privacy import get_policy
+
+            policy = get_policy(self.project)
+            if policy is not None:
+                self.overlap = policy.required_annotations
         if self.inner_id == 0:
             task = Task.objects.filter(project=self.project).order_by('-inner_id').first()
             max_inner_id = 1
@@ -734,6 +756,7 @@ class Annotation(AnnotationMixin, FsmHistoryStateModel):
     )
 
     unique_id = models.UUIDField(default=uuid.uuid4, null=True, blank=True, unique=True, editable=False)
+    revision = models.PositiveIntegerField(default=1, help_text='Optimistic version of the annotation')
     task_assignment = models.ForeignKey(
         'collab.TaskAssignment',
         on_delete=models.SET_NULL,
@@ -1465,6 +1488,16 @@ def update_project_summary_annotations_and_is_labeled(sender, instance, created,
     instance.task.update_is_labeled()
     instance.task.save(update_fields=['is_labeled', 'total_annotations', 'cancelled_annotations'], skip_fsm=True)
     logger.debug(f'Updated total_annotations and cancelled_annotations for {instance.task.id}.')
+    from collab.reviews import refresh_task_agreement
+
+    refresh_task_agreement(instance.task_id)
+
+
+@receiver(post_delete, sender=Annotation)
+def refresh_agreement_after_annotation_delete(sender, instance, **kwargs):
+    from collab.reviews import refresh_task_agreement
+
+    refresh_task_agreement(instance.task_id)
 
 
 @receiver(pre_delete, sender=Prediction)
@@ -1588,6 +1621,24 @@ def deprecated_bulk_update_stats_project_tasks(tasks, project=None):
 def bulk_update_stats_project_tasks(tasks, project=None):
     # Avoid circular import
     from projects.functions.utils import get_unique_ids_list
+    from collab.privacy import get_policy
+
+    task_ids = get_unique_ids_list(tasks)
+    if not task_ids:
+        return
+    if project is None:
+        project = Task.objects.get(pk=task_ids[0]).project
+    policy = get_policy(project)
+    if policy is not None:
+        tasks_qs = Task.objects.filter(pk__in=task_ids, project=project)
+        finished_ids = tasks_qs.annotate(
+            independent_authors=Count('annotations__completed_by', distinct=True, filter=Q(
+                annotations__was_cancelled=False, annotations__ground_truth=False,
+                annotations__result__isnull=False,
+            ))
+        ).filter(independent_authors__gte=policy.required_annotations).values('id')
+        tasks_qs.update(is_labeled=Q(id__in=finished_ids))
+        return
 
     bulk_update_is_labeled = load_func(settings.BULK_UPDATE_IS_LABELED)
 

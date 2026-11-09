@@ -16,7 +16,6 @@ _common_storage_schema_properties = {
 _local_files_import_storage_schema = {
     'type': 'object',
     'properties': _common_storage_schema_properties,
-    'required': [],
 }
 
 # Local files import storage schema with ID
@@ -26,14 +25,12 @@ _local_files_import_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_local_files_import_storage_schema['properties'],
     },
-    'required': [],
 }
 
 # Local files export storage schema
 _local_files_export_storage_schema = {
     'type': 'object',
     'properties': _common_storage_schema_properties,
-    'required': [],
 }
 
 # Local files export storage schema with ID
@@ -43,5 +40,4 @@ _local_files_export_storage_schema_with_id = {
         'id': {'type': 'integer', 'description': 'Storage ID. If set, storage with specified ID will be updated'},
         **_local_files_export_storage_schema['properties'],
     },
-    'required': [],
 }

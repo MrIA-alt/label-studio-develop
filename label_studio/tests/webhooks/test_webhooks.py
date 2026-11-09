@@ -10,12 +10,24 @@ from webhooks.models import Webhook, WebhookAction
 from webhooks.utils import emit_webhooks, emit_webhooks_for_instance, run_webhook
 
 
+@pytest.fixture(autouse=True)
+def mock_native_webhook_transport(monkeypatch, settings):
+    """These tests cover dispatch/serialization; transport isolation has dedicated tests."""
+    settings.COLLAB_WEBHOOK_ALLOW_PRIVATE = True
+
+    def post_once(url, body, headers):
+        return requests.post(url, data=body, headers=headers, timeout=5, allow_redirects=False).status_code
+
+    monkeypatch.setattr('collab.webhooks._post_once', post_once)
+
+
 @pytest.fixture
 def organization_webhook(configured_project):
     organization = configured_project.organization
     uri = 'http://127.0.0.1:8000/api/organization/'
     return Webhook.objects.create(
         organization=organization,
+        approved_by=organization.created_by,
         project=None,
         url=uri,
     )
@@ -27,6 +39,7 @@ def project_webhook(configured_project):
     uri = 'http://127.0.0.1:8000/api/project/'
     return Webhook.objects.create(
         organization=organization,
+        approved_by=organization.created_by,
         project=configured_project,
         url=uri,
     )
@@ -38,6 +51,7 @@ def ml_start_training_webhook(configured_project):
     uri = 'http://0.0.0.0:9090/webhook'
     return Webhook.objects.create(
         organization=organization,
+        approved_by=organization.created_by,
         project=configured_project,
         url=uri,
     )

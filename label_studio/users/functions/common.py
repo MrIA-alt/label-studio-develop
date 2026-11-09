@@ -63,14 +63,9 @@ def save_user(request, next_page, user_form):
 
     if Organization.objects.exists():
         org = Organization.objects.first()
-        # Users signing up via invite link get labeller role;
-        # users signing up via open registration get admin role.
-        token = request.GET.get('token')
-        if token:
-            role = OrganizationMember.Role.LABELLER
-        else:
-            role = OrganizationMember.Role.ADMIN
-        org.add_user(user, role=role)
+        # Only the initial organisation owner bootstraps administration.
+        # Subsequent registrations never choose their own elevated role.
+        org.add_user(user, role=OrganizationMember.Role.LABELLER)
     else:
         org = Organization.create_organization(created_by=user, title='Label Studio')
     user.active_organization = org

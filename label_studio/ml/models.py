@@ -232,10 +232,15 @@ class MLBackend(models.Model):
                 MLBackendTrainJob.objects.create(job_id=current_train_job, ml_backend=self)
         self.save()
 
-    def _predict(self, task):
+    def _predict(self, task, request):
         """This is low level prediction method that is used for debugging"""
         ml_api = self.api
-        task_ser = TaskSimpleSerializer(task).data
+        from collab.privacy import can_access_task
+        from rest_framework.exceptions import PermissionDenied
+
+        if not can_access_task(request.user, task):
+            raise PermissionDenied('The task is not accessible.')
+        task_ser = TaskSimpleSerializer(task, context={'request': request}).data
 
         request_params = ml_api._prep_prediction_req([task_ser], self.project)
         ml_api_result = ml_api._request(PREDICT_URL, request_params, verbose=False, timeout=TIMEOUT_PREDICT)
@@ -253,7 +258,10 @@ class MLBackend(models.Model):
                 'error_message': ml_api_result.error_message,
                 'url': ml_api._get_url(PREDICT_URL),
                 'task': task_ser,
-                'request': request_params,
+                'request': {
+                    **request_params,
+                    'params': {'context': request_params.get('params', {}).get('context')},
+                },
                 'response': results,
             },
         }

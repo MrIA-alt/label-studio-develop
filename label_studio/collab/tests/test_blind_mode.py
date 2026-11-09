@@ -46,7 +46,9 @@ def env():
 
 
 def set_policy(project, **kwargs):
-    return ProjectAnnotationPolicy.objects.update_or_create(project=project, defaults=kwargs)[0]
+    policy = ProjectAnnotationPolicy.objects.update_or_create(project=project, defaults=kwargs)[0]
+    project._collab_policy = policy
+    return policy
 
 
 def annotate(env, user, choice):

@@ -28,7 +28,7 @@ class ProjectWebhookSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Project
-        fields = '__all__'
+        exclude = ('task_data_login', 'task_data_password')
 
 
 class TaskWebhookSerializer(serializers.ModelSerializer):

@@ -6,7 +6,7 @@ if (typeof globalThis.structuredClone === "undefined") {
   globalThis.structuredClone = (obj) => JSON.parse(JSON.stringify(obj));
 }
 
-import { getRoot, types } from "mobx-state-tree";
+import { destroy, getRoot, getSnapshot, types } from "mobx-state-tree";
 
 jest.mock("../../../../utils/feature-flags", () => ({
   isFF: jest.fn(() => false),
@@ -61,6 +61,7 @@ import { ImageModel } from "../Image";
 import { SNAP_TO_PIXEL_MODE } from "../../../../components/ImageView/Image";
 import * as featureFlags from "../../../../utils/feature-flags";
 import { FF_ZOOM_OPTIM } from "../../../../utils/feature-flags";
+import TimeTraveller from "../../../../core/TimeTraveller";
 
 const defaultHistory = {
   freeze: () => {},
@@ -153,6 +154,27 @@ function createStoreWithStates(statesForImage = []) {
       names: new Map(),
       image: { name: "img", value: "$url", type: "image" },
     },
+  });
+}
+
+const HistoryAnnotation = MockAnnotation.props({
+  trackedState: types.optional(types.model({ choice: types.optional(types.string, "a") }), {}),
+  history: types.optional(TimeTraveller, { targetPath: "../trackedState" }),
+}).actions((self) => ({
+  changeChoice(value) {
+    self.trackedState.choice = value;
+  },
+  reinitHistory(force) {
+    self.history.reinit(force);
+  },
+}));
+const HistoryRoot = Root.props({ annotation: HistoryAnnotation });
+
+function createHistoryStore() {
+  const snapshot = getSnapshot(createStore());
+  return HistoryRoot.create({
+    ...snapshot,
+    annotation: { ...snapshot.annotation, history: { targetPath: "../trackedState" }, trackedState: {} },
   });
 }
 
@@ -948,6 +970,46 @@ describe("Image model", () => {
   });
 
   describe("onResize", () => {
+    it("preserves a classification edit when image geometry finishes loading later", async () => {
+      const store = createHistoryStore();
+      const annotation = store.annotation;
+      expect(annotation.history.canUndo).toBe(false);
+      annotation.changeChoice("b");
+      expect(annotation.history.canUndo).toBe(true);
+
+      annotation.image._updateRegionsSizes({ width: 200, height: 160, naturalWidth: 100, naturalHeight: 80 });
+      await Promise.resolve();
+
+      expect(annotation.trackedState.choice).toBe("b");
+      expect(annotation.history.canUndo).toBe(true);
+      expect(annotation.history.isFrozen).toBe(false);
+      annotation.history.undo();
+      expect(annotation.trackedState.choice).toBe("a");
+      destroy(store);
+    });
+
+    it("finishes resize history before the next user input can be recorded", async () => {
+      const store = createHistoryStore();
+      const annotation = store.annotation;
+      annotation.image._updateRegionsSizes({ width: 200, height: 160, naturalWidth: 100, naturalHeight: 80 });
+      await Promise.resolve();
+      expect(annotation.history.isFrozen).toBe(false);
+      expect(annotation.history.canUndo).toBe(false);
+
+      annotation.changeChoice("b");
+      expect(annotation.history.canUndo).toBe(true);
+      annotation.history.undo();
+      expect(annotation.trackedState.choice).toBe("a");
+      destroy(store);
+    });
+
+    it("does not access a destroyed annotation from resize finalization", async () => {
+      const store = createHistoryStore();
+      store.annotation.image._updateRegionsSizes({ width: 200, height: 160, naturalWidth: 100, naturalHeight: 80 });
+      destroy(store);
+      await expect(Promise.resolve()).resolves.toBeUndefined();
+    });
+
     it("calls _updateImageSize and sets sizeUpdated", () => {
       const store = createStore();
       const image = store.annotation.image;

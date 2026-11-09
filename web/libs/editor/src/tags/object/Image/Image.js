@@ -1,6 +1,6 @@
 import { ff } from "@humansignal/core";
 import { inject } from "mobx-react";
-import { destroy, getRoot, getType, types } from "mobx-state-tree";
+import { destroy, getRoot, getType, isAlive, types } from "mobx-state-tree";
 
 import ImageView from "../../../components/ImageView/ImageView";
 import { customTypes } from "../../../core/CustomTypes";
@@ -1131,24 +1131,28 @@ const Model = types
     },
 
     _updateRegionsSizes({ width, height, naturalWidth, naturalHeight, userResize }) {
-      const _historyLength = self.annotation?.history?.history?.length;
-
-      self.annotation.history.freeze();
-
-      self.regions.forEach((shape) => {
-        shape.updateImageSize?.(width / naturalWidth, height / naturalHeight, width, height, userResize);
-      });
-      self.regs.forEach((shape) => {
-        shape.updateImageSize?.(width / naturalWidth, height / naturalHeight, width, height, userResize);
-      });
-      self.drawingRegion?.updateImageSize(width / naturalWidth, height / naturalHeight, width, height, userResize);
-
-      setTimeout(self.annotation.history.unfreeze, 0);
-
-      //sometimes when user zoomed in, annotation was creating a new history. This fix that in case the user has nothing in the history yet
-      if (_historyLength <= 1) {
-        // Don't force unselection of regions during the updateObjects callback from history reinit
-        setTimeout(() => self.annotation?.reinitHistory(false), 0);
+      const annotation = self.annotation;
+      const history = annotation.history;
+      const pristine = history.history.length <= 1;
+      const lock = Symbol("image:resize");
+      history.freeze(lock);
+      try {
+        self.regions.forEach((shape) => {
+          shape.updateImageSize?.(width / naturalWidth, height / naturalHeight, width, height, userResize);
+        });
+        self.regs.forEach((shape) => {
+          shape.updateImageSize?.(width / naturalWidth, height / naturalHeight, width, height, userResize);
+        });
+        self.drawingRegion?.updateImageSize(width / naturalWidth, height / naturalHeight, width, height, userResize);
+      } finally {
+        // MobX flushes the resize snapshot at the end of this action. Finish
+        // its baseline before the next input event, rather than keeping history
+        // frozen across a timer that can swallow text/classification edits.
+        queueMicrotask(() => {
+          if (!isAlive(annotation) || annotation.history !== history) return;
+          history.unfreeze(lock);
+          if (pristine && !history.isFrozen) annotation.reinitHistory(false);
+        });
       }
     },
 
@@ -1170,8 +1174,8 @@ const Model = types
       } else {
         self.sizeToAuto();
       }
-      // Don't force unselection of regions during the updateObjects callback from history reinit
-      setTimeout(() => self.annotation?.reinitHistory(false), 0);
+      // Region resizing above owns history finalization and preserves any
+      // edits made before this image finished loading.
     },
 
     checkLabels() {

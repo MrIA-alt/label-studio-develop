@@ -13,6 +13,7 @@ class WebhookSerializer(serializers.ModelSerializer):
         model = Webhook
         fields = (
             'id',
+            'approved_by',
             'organization',
             'project',
             'url',
@@ -24,7 +25,7 @@ class WebhookSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         )
-        read_only_fields = ('id', 'organization', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'organization', 'approved_by', 'created_at', 'updated_at')
 
     def validate(self, attrs):
         actions = attrs.pop('_actions', [])

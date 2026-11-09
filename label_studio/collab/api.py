@@ -1,12 +1,14 @@
-import hashlib
-import json
+import math
+from collections.abc import Mapping
 
 from core.permissions import ViewClassPermission, all_permissions
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.http import Http404
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from drf_spectacular.utils import extend_schema_serializer
 from projects.models import Project, ProjectMember
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
@@ -16,22 +18,35 @@ from tasks.models import Annotation, Task
 from users.models import User
 
 from collab import audit, privacy, reviews, services, webhooks
+from collab.authentication import issue_service_token
+from collab.base import ExtensionView
+from collab.idempotency import idempotent_mutation, run_idempotent
 from collab.models import (
     AnnotationReview,
     AuditEvent,
-    IdempotencyRecord,
     ProjectAnnotationPolicy,
     ServiceAccount,
     TaskAssignment,
+    WebhookDelivery,
     WebhookSubscription,
 )
-from collab.base import ExtensionView
-from collab.permissions import ensure_project_allowed, get_service_account
+from collab.permissions import ensure_project_allowed, get_service_account, has_service_scope
+from collab.lifecycle import ensure_project_writable, set_archived
 
 
 class ExtensionPagination(LimitOffsetPagination):
     default_limit = 100
     max_limit = 500
+
+    def get_limit(self, request):
+        if 'limit' in request.query_params:
+            serializers.IntegerField(min_value=1, max_value=self.max_limit).run_validation(request.query_params['limit'])
+        return super().get_limit(request)
+
+    def get_offset(self, request):
+        if 'offset' in request.query_params:
+            serializers.IntegerField(min_value=0).run_validation(request.query_params['offset'])
+        return super().get_offset(request)
 
 
 def paginate(request, items, serialize):
@@ -40,7 +55,31 @@ def paginate(request, items, serialize):
     return paginator.get_paginated_response(serialize(page))
 
 
-class PolicySerializer(serializers.ModelSerializer):
+def _query_id(request, name):
+    value = request.query_params.get(name)
+    if value is None:
+        return None
+    try:
+        return serializers.IntegerField(min_value=1).run_validation(value)
+    except serializers.ValidationError as exc:
+        raise serializers.ValidationError({name: exc.detail})
+
+
+class StrictInput:
+    def to_internal_value(self, data):
+        if isinstance(data, Mapping):
+            unknown = set(data) - set(self.fields)
+            if unknown:
+                raise serializers.ValidationError({name: ['Unknown field.'] for name in sorted(unknown)})
+        return super().to_internal_value(data)
+
+
+class PolicySerializer(StrictInput, serializers.ModelSerializer):
+    def validate_agreement_threshold(self, value):
+        if not math.isfinite(value):
+            raise serializers.ValidationError('Use a finite agreement threshold.')
+        return value
+
     class Meta:
         model = ProjectAnnotationPolicy
         fields = (
@@ -53,34 +92,62 @@ class PolicySerializer(serializers.ModelSerializer):
             'assignment_ttl_hours',
             'anonymous_review',
             'agreement_threshold',
+            'is_archived',
         )
+        read_only_fields = ('is_archived',)
 
 
 class AssignmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = TaskAssignment
-        fields = ('id', 'task', 'project', 'user', 'status', 'assigned_at', 'started_at', 'submitted_at', 'expires_at')
+        fields = ('id', 'task', 'project', 'user', 'status', 'assigned_at', 'started_at', 'submitted_at', 'expires_at', 'version')
 
 
-class BulkAssignSerializer(serializers.Serializer):
+class DistributionInputSerializer(StrictInput, serializers.Serializer):
+    limit = serializers.IntegerField(required=False, min_value=1, max_value=100000)
+
+
+class AssignmentActionInputSerializer(StrictInput, serializers.Serializer):
+    version = serializers.IntegerField(required=False, min_value=1)
+
+
+class AssignmentStaffInputSerializer(AssignmentActionInputSerializer):
+    user_id = serializers.IntegerField(required=False, min_value=1)
+
+
+class BulkAssignSerializer(StrictInput, serializers.Serializer):
     task_ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=5000)
     user_ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=500)
     expires_at = serializers.DateTimeField(required=False, allow_null=True)
 
+    def validate_expires_at(self, value):
+        if value and value <= timezone.now():
+            raise serializers.ValidationError('Expiration must be in the future.')
+        return value
 
-class ReviewInputSerializer(serializers.Serializer):
+
+class ReviewInputSerializer(StrictInput, serializers.Serializer):
     annotation = serializers.IntegerField()
+    revision = serializers.IntegerField(
+        required=False, min_value=1,
+        help_text='Displayed annotation revision. Required for collaborative projects unless If-Match is supplied.',
+    )
     decision = serializers.ChoiceField(choices=AnnotationReview.Decision.choices)
     comment = serializers.CharField(required=False, allow_blank=True, default='', max_length=5000)
 
 
-class FinalAnnotationSerializer(serializers.Serializer):
+class FinalAnnotationSerializer(StrictInput, serializers.Serializer):
     result = serializers.ListField(child=serializers.DictField())
 
 
-def _project_for(request, pk):
-    project = get_object_or_404(Project.objects.for_user(request.user), pk=pk)
+def _project_for(request, pk, writable=True, with_policy=False):
+    projects = Project.objects.for_user(request.user)
+    if with_policy:
+        projects = projects.select_related('annotation_policy')
+    project = get_object_or_404(projects, pk=pk)
     ensure_project_allowed(request.user, project)
+    if writable and request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        ensure_project_writable(project)
     return project
 
 
@@ -90,21 +157,56 @@ def _is_policy_admin(user):
     )
 
 
+@transaction.atomic
 def apply_policy(project, data, partial=False):
-    policy = privacy.get_policy(project) or ProjectAnnotationPolicy(project=project)
+    # Use the same project-first lock order as archival and distribution.
+    current = services.lock_project(project.pk)
+    ensure_project_writable(current)
+    project.maximum_annotations = current.maximum_annotations
+    project.overlap_cohort_percentage = current.overlap_cohort_percentage
+    policy = ProjectAnnotationPolicy.objects.filter(project=project).first() or ProjectAnnotationPolicy(project=project)
     ser = PolicySerializer(policy, data=data, partial=partial)
     ser.is_valid(raise_exception=True)
     policy = ser.save(project=project)
-    if project.maximum_annotations != policy.required_annotations:
+    project._collab_policy = policy
+    if project.maximum_annotations != policy.required_annotations or project.overlap_cohort_percentage != 100:
         project.maximum_annotations = policy.required_annotations
-        project.save(update_fields=['maximum_annotations'])
+        project.overlap_cohort_percentage = 100
+        project.save(update_fields=['maximum_annotations', 'overlap_cohort_percentage'])
+    project.tasks.update(overlap=policy.required_annotations)
+    from tasks.models import bulk_update_stats_project_tasks
+    bulk_update_stats_project_tasks(project.tasks.all(), project)
+    from core.current_request import CurrentContext
+    from fsm.functions import sync_collaborative_task_states
+
+    sync_collaborative_task_states(project, user=CurrentContext.get_user())
     return policy
+
+
+class ProjectArchiveAPI(ExtensionView):
+    """Archive a campaign, preserving authorized read access and existing results."""
+    required_scopes = {'POST': 'projects:write'}
+    permission_required = all_permissions.projects_create
+    archived = True
+
+    def post(self, request, pk):
+        project = _project_for(request, pk, writable=False)
+        if not _is_policy_admin(request.user):
+            raise PermissionDenied('Only administrators can archive or restore a project.')
+        if request.data:
+            raise serializers.ValidationError({'detail': 'This operation accepts an empty body.'})
+        return Response(PolicySerializer(set_archived(project, request, self.archived)).data)
+
+
+class ProjectRestoreAPI(ProjectArchiveAPI):
+    """Restore a campaign and allow its annotation workflow to continue."""
+    archived = False
 
 
 class ProjectPolicyAPI(ExtensionView):
     """GET: any project member. PUT/PATCH: organization admins and authorised service accounts."""
 
-    required_scopes = {'PUT': 'policy:write', 'PATCH': 'policy:write'}
+    required_scopes = {'GET': 'policy:read', 'PUT': 'policy:write', 'PATCH': 'policy:write'}
     permission_required = ViewClassPermission(
         GET=all_permissions.projects_view,
         PUT=all_permissions.projects_change,
@@ -112,12 +214,16 @@ class ProjectPolicyAPI(ExtensionView):
     )
 
     def get(self, request, pk):
-        project = _project_for(request, pk)
-        policy = privacy.get_policy(project)
+        project = _project_for(request, pk, with_policy=True)
+        try:
+            policy = project.annotation_policy
+        except ProjectAnnotationPolicy.DoesNotExist:
+            policy = None
         if policy is None:
             policy = ProjectAnnotationPolicy(project=project, required_annotations=project.maximum_annotations or 1)
         return Response(PolicySerializer(policy).data)
 
+    @transaction.atomic
     def _update(self, request, pk, partial):
         if not _is_policy_admin(request.user):
             raise PermissionDenied('Only administrators can change the annotation policy.')
@@ -147,6 +253,7 @@ class BulkAssignmentAPI(ExtensionView):
         qs = TaskAssignment.objects.filter(project=project).order_by('id')
         return paginate(request, qs, lambda page: AssignmentSerializer(page, many=True).data)
 
+    @transaction.atomic
     def post(self, request, pk):
         project = _project_for(request, pk)
         ser = BulkAssignSerializer(data=request.data)
@@ -172,22 +279,27 @@ class MyAssignmentsAPI(ExtensionView):
     """The caller's own assignments only."""
 
     permission_required = all_permissions.tasks_view
+    required_scopes = {'GET': 'assignments:read'}
 
     def get(self, request):
         qs = TaskAssignment.objects.filter(
             user=request.user,
-            status__in=TaskAssignment.VISIBLE_STATUSES,
-            project__organization=request.user.active_organization,
+            project__in=Project.objects.for_user(request.user),
         ).order_by('id')
-        project_id = request.query_params.get('project')
+        project_id = _query_id(request, 'project')
         if project_id:
             qs = qs.filter(project_id=project_id)
+        if request.query_params.get('status'):
+            value = request.query_params['status']
+            if value not in TaskAssignment.Status.values:
+                raise serializers.ValidationError({'status': 'Unknown assignment status.'})
+            qs = qs.filter(status=value)
         return paginate(request, qs, lambda page: AssignmentSerializer(page, many=True).data)
 
 
 def _assignment_for_owner(request, pk):
     return get_object_or_404(
-        TaskAssignment, pk=pk, user=request.user, project__organization=request.user.active_organization
+        TaskAssignment, pk=pk, user=request.user, project__in=Project.objects.for_user(request.user)
     )
 
 
@@ -203,6 +315,7 @@ class AssignmentActionAPI(ExtensionView):
     """Annotator actions on their own assignment: start, skip, release."""
 
     permission_required = all_permissions.tasks_view
+    required_scopes = {'POST': 'assignments:write'}
 
     ACTIONS = {
         'start': TaskAssignment.Status.IN_PROGRESS,
@@ -214,8 +327,10 @@ class AssignmentActionAPI(ExtensionView):
         target = self.ACTIONS.get(action)
         if target is None:
             raise Http404
+        ser = AssignmentActionInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
         assignment = _assignment_for_owner(request, pk)
-        return Response(AssignmentSerializer(services.transition(assignment, target)).data)
+        return Response(AssignmentSerializer(services.transition(assignment, target, expected_version=ser.validated_data.get('version'))).data)
 
 
 class AssignmentStaffActionAPI(ExtensionView):
@@ -226,14 +341,19 @@ class AssignmentStaffActionAPI(ExtensionView):
 
     def post(self, request, pk, action):
         assignment = _assignment_for_staff(request, pk)
+        ser = AssignmentStaffInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        version = ser.validated_data.get('version')
         if action == 'cancel':
-            result = services.transition(assignment, TaskAssignment.Status.CANCELLED)
+            result = services.transition(assignment, TaskAssignment.Status.CANCELLED, expected_version=version)
         elif action == 'reassign':
+            if 'user_id' not in ser.validated_data:
+                raise serializers.ValidationError({'user_id': 'This field is required for reassign.'})
             user = get_object_or_404(
                 User.objects.filter(organizations=assignment.project.organization).distinct(),
-                pk=request.data.get('user_id') or 0,
+                pk=ser.validated_data['user_id'],
             )
-            result = services.reassign(assignment, user, assigned_by=request.user)
+            result = services.reassign(assignment, user, assigned_by=request.user, expected_version=version)
         else:
             raise Http404
         audit.record(request, f'assignment.{action}', assignment.project, 'assignment', assignment.pk)
@@ -251,9 +371,10 @@ class DistributeAPI(ExtensionView):
         policy = privacy.get_policy(project)
         if policy is None or policy.assignment_mode not in ('automatic', 'hybrid'):
             raise serializers.ValidationError({'detail': 'Project is not in automatic or hybrid assignment mode.'})
-        services.expire_overdue()
-        limit = request.data.get('limit')
-        created = services.distribute_project(project, limit=int(limit) if limit else None, assigned_by=request.user)
+        services.expire_overdue(project=project)
+        ser = DistributionInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        created = services.distribute_project(project, limit=ser.validated_data.get('limit'), assigned_by=request.user)
         audit.record(request, 'assignments.distribute', project, 'project', project.pk, created=created)
         return Response({'created': created})
 
@@ -263,12 +384,19 @@ def _assignment_stats(project):
     rows = TaskAssignment.objects.filter(project=project).values('task_id', 'user_id', 'status').annotate(n=Count('id'))
     per_task, workload = {}, {}
     for row in rows:
-        per_task.setdefault(row['task_id'], {})[row['status']] = row['n']
+        task_counts = per_task.setdefault(row['task_id'], {})
+        task_counts[row['status']] = task_counts.get(row['status'], 0) + row['n']
         user_counts = workload.setdefault(row['user_id'], {})
         user_counts[row['status']] = user_counts.get(row['status'], 0) + row['n']
+    completed = reviews.countable(Annotation.objects.filter(project=project)).values('task_id').annotate(
+        n=Count('completed_by_id', distinct=True)
+    )
+    actual_done = {row['task_id']: row['n'] for row in completed}
     states = {}
     for task_id in Task.objects.filter(project=project).values_list('id', flat=True):
-        state = services.task_global_state(task_id, required, per_task.get(task_id, {}))
+        counts = per_task.get(task_id, {})
+        counts['_done_count'] = actual_done.get(task_id, 0)
+        state = services.task_global_state(task_id, required, counts)
         states[state] = states.get(state, 0) + 1
     return {
         'required_annotations': required,
@@ -309,13 +437,11 @@ class ProgressAPI(ExtensionView):
         data['tasks_with_final_annotation'] = Task.objects.filter(
             project=project, arbitration__final_annotation__isnull=False
         ).count()
-        flagged = [
-            t.pk
-            for t in eligible.order_by('id')[:2000]
-            if reviews.build_review_view(t)['agreement']['disagreement']
-        ]
-        data['disagreement_tasks'] = len(flagged)
-        data['disagreement_task_ids'] = flagged[:200]
+        policy = privacy.get_policy(project)
+        flagged = eligible.filter(precomputed_agreement__lt=policy.agreement_threshold if policy else 0.8)
+        data['disagreement_tasks'] = flagged.count()
+        data['agreement_pending_tasks'] = eligible.filter(precomputed_agreement__isnull=True).count()
+        data['disagreement_task_ids'] = list(flagged.order_by('id').values_list('pk', flat=True)[:200])
         return Response(data)
 
 
@@ -328,8 +454,8 @@ class ReviewQueueAPI(ExtensionView):
     def get(self, request, pk):
         project = _project_for(request, pk)
         flt = request.query_params.get('status', 'pending')
-        if flt not in ('pending', 'disagreement', 'all'):
-            raise serializers.ValidationError({'status': 'Use pending, disagreement or all.'})
+        if flt not in ('pending', 'disagreement', 'accepted', 'rejected', 'all'):
+            raise serializers.ValidationError({'status': 'Use pending, disagreement, accepted, rejected or all.'})
         anonymous = privacy_anonymous(project, request)
         tasks = reviews.eligible_tasks(project).order_by('id')
         if flt == 'pending':
@@ -338,13 +464,15 @@ class ReviewQueueAPI(ExtensionView):
                 annotations__was_cancelled=False,
                 annotations__ground_truth=False,
             ).distinct()
+        elif flt in ('accepted', 'rejected'):
+            tasks = Task.objects.filter(project=project, annotations__review_status=flt).distinct().order_by('id')
 
         def serialize(page):
             return [_queue_item(t, anonymous) for t in page]
 
         if flt == 'disagreement':
-            flagged = [t for t in tasks[:2000] if reviews.build_review_view(t)['agreement']['disagreement']]
-            return paginate(request, flagged, serialize)
+            policy = privacy.get_policy(project)
+            tasks = tasks.filter(precomputed_agreement__lt=policy.agreement_threshold if policy else 0.8)
         return paginate(request, tasks, serialize)
 
 
@@ -368,7 +496,7 @@ def _queue_item(task, anonymous):
 class TaskReviewAPI(ExtensionView):
     """Supervisor view of one task: annotations, differences, history. `?anonymous=1` hides annotator identities."""
 
-    required_scopes = {'GET': 'progress:read'}
+    required_scopes = {'GET': 'reviews:read'}
     permission_required = all_permissions.projects_change
 
     def get(self, request, pk):
@@ -383,6 +511,7 @@ class ReviewAPI(ExtensionView):
     required_scopes = {'POST': 'reviews:write'}
     permission_required = all_permissions.annotations_change
 
+    @idempotent_mutation('review-create')
     def post(self, request):
         if privacy.is_restricted_user(request.user):
             raise PermissionDenied('Only QA and admin users can review annotations.')
@@ -394,7 +523,8 @@ class ReviewAPI(ExtensionView):
         )
         ensure_project_allowed(request.user, annotation.project)
         review = reviews.apply_review(
-            annotation, request.user, ser.validated_data['decision'], ser.validated_data['comment']
+            annotation, request.user, ser.validated_data['decision'], ser.validated_data['comment'],
+            expected_revision=request.headers.get('If-Match', ser.validated_data.get('revision')),
         )
         audit.record(
             request, 'review.decide', annotation.project, 'annotation', annotation.pk, decision=review.decision
@@ -411,6 +541,7 @@ class FinalAnnotationAPI(ExtensionView):
     required_scopes = {'POST': 'reviews:write'}
     permission_required = all_permissions.annotations_change
 
+    @idempotent_mutation('final-annotation')
     def post(self, request, pk):
         if privacy.is_restricted_user(request.user):
             raise PermissionDenied('Only QA and admin users can arbitrate.')
@@ -427,13 +558,18 @@ class MyReviewsAPI(ExtensionView):
     """Review feedback (decision + comment) on the caller's own annotations. Never exposes anybody else's."""
 
     permission_required = all_permissions.tasks_view
+    required_scopes = {'GET': 'reviews:read'}
 
     def get(self, request):
         qs = AnnotationReview.objects.filter(annotation__completed_by=request.user).exclude(
             decision=AnnotationReview.Decision.REFERENCE
         )
-        if request.query_params.get('task'):
-            qs = qs.filter(annotation__task_id=request.query_params['task'])
+        qs = qs.filter(annotation__project__in=Project.objects.for_user(request.user))
+        project_id, task_id = _query_id(request, 'project'), _query_id(request, 'task')
+        if project_id:
+            qs = qs.filter(annotation__project_id=project_id)
+        if task_id:
+            qs = qs.filter(annotation__task_id=task_id)
 
         def serialize(page):
             return [
@@ -464,6 +600,13 @@ class ResultsAPI(ExtensionView):
             raise serializers.ValidationError({'only': 'Use all, accepted or final.'})
         anonymous = privacy_anonymous(project, request)
         tasks = Task.objects.filter(project=project).order_by('id')
+        if only == 'accepted':
+            tasks = tasks.filter(
+                annotations__review_status=Annotation.REVIEW_ACCEPTED,
+                annotations__ground_truth=False, annotations__was_cancelled=False,
+            ).distinct()
+        elif only == 'final':
+            tasks = tasks.filter(arbitration__final_annotation__isnull=False)
 
         def serialize(page):
             out = []
@@ -484,11 +627,13 @@ class ResultsAPI(ExtensionView):
                         'task': task.pk,
                         'data': task.data,
                         'annotations': [] if only == 'final' else [
-                            {k: a[k] for k in ('id', 'annotator', 'result', 'review_status', 'revision')}
+                            {k: a[k] for k in ('id', 'annotator', 'result', 'review_status', 'revision', 'reviews', 'revisions')}
                             for a in annotations
                         ],
                         'final_result': final,
                         'agreement': view['agreement']['score'],
+                        'agreement_details': view['agreement'],
+                        'arbitration': view['arbitration'],
                     }
                 )
             return out
@@ -496,12 +641,15 @@ class ResultsAPI(ExtensionView):
         return paginate(request, tasks, serialize)
 
 
-class ProjectCreateSerializer(serializers.Serializer):
+class ProjectCreateSerializer(StrictInput, serializers.Serializer):
     title = serializers.CharField(min_length=settings.PROJECT_TITLE_MIN_LEN, max_length=settings.PROJECT_TITLE_MAX_LEN)
     description = serializers.CharField(required=False, allow_blank=True, default='', max_length=10000)
     expert_instruction = serializers.CharField(required=False, allow_blank=True, default='', max_length=50000)
     label_config = serializers.CharField(max_length=1000000)
-    policy = PolicySerializer(required=False)
+    policy = PolicySerializer(
+        required=False,
+        help_text='Explicit policy configuration requires policy:write for service accounts; omit it to use the confidential defaults.',
+    )
     member_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list, max_length=500)
     publish = serializers.BooleanField(required=False, default=False)
 
@@ -513,10 +661,6 @@ class ProjectCreateSerializer(serializers.Serializer):
         return value
 
 
-def _request_hash(data):
-    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
-
-
 class ProjectCreateAPI(ExtensionView):
     """Create a fully configured project in one idempotent call (header `Idempotency-Key` is required)."""
 
@@ -524,21 +668,14 @@ class ProjectCreateAPI(ExtensionView):
     permission_required = all_permissions.projects_create
 
     def post(self, request):
-        key = request.headers.get('Idempotency-Key', '').strip()
-        if not key or len(key) > 128:
-            raise serializers.ValidationError({'detail': 'A valid Idempotency-Key header (max 128 chars) is required.'})
-        body_hash = _request_hash(request.data)
-        record, created = IdempotencyRecord.objects.get_or_create(
-            user=request.user, key=key, endpoint='project-create', defaults={'request_hash': body_hash}
-        )
-        if not created:
-            if record.request_hash != body_hash:
-                return Response({'detail': 'Idempotency-Key reused with a different payload.'}, status=409)
-            if record.response_body is None:
-                return Response({'detail': 'A request with this key is still in progress.'}, status=409)
-            return Response(record.response_body, status=record.response_status, headers={'Idempotent-Replay': 'true'})
+        if (
+            get_service_account(request.user) is not None
+            and isinstance(request.data, Mapping) and 'policy' in request.data
+            and not has_service_scope(request.user, 'policy:write')
+        ):
+            raise PermissionDenied('Explicit policy configuration requires policy:write.')
 
-        try:
+        def create():
             ser = ProjectCreateSerializer(data=request.data)
             ser.is_valid(raise_exception=True)
             data = ser.validated_data
@@ -555,30 +692,36 @@ class ProjectCreateAPI(ExtensionView):
                     organization=org,
                     created_by=request.user,
                 )
-                if data.get('policy'):
-                    apply_policy(project, data['policy'])
+                policy_data = {
+                    'required_annotations': 2, 'blind_mode': True,
+                    'assignment_mode': 'manual', 'review_mode': 'manual',
+                    **data.get('policy', {}),
+                }
+                apply_policy(project, policy_data)
+                ProjectMember.objects.get_or_create(project=project, user=request.user)
                 for user in members:
                     ProjectMember.objects.get_or_create(project=project, user=user)
                 if data['publish']:
                     project.is_published = True
                     project.save(update_fields=['is_published', 'is_draft'])
-                audit.record(request, 'project.create', project, 'project', project.pk, idempotency_key=key)
+                account = get_service_account(request.user)
+                if account and not account.all_projects:
+                    account.projects.add(project)
+                audit.record(request, 'project.create', project, 'project', project.pk)
             body = {'id': project.pk, 'title': project.title, 'is_published': project.is_published}
-            record.response_status, record.response_body = 201, body
-            record.save(update_fields=['response_status', 'response_body'])
             return Response(body, status=201)
-        except Exception:
-            # a failed attempt must not block a corrected retry with the same key
-            record.delete()
-            raise
+        return run_idempotent(request, 'project-create', create)
 
 
 class ProjectPublishAPI(ExtensionView):
     required_scopes = {'POST': 'projects:write'}
     permission_required = all_permissions.projects_change
 
+    @transaction.atomic
     def post(self, request, pk):
         project = _project_for(request, pk)
+        project = services.lock_project(project.pk)
+        ensure_project_writable(project)
         if not project.is_published:
             project.is_published = True
             project.save(update_fields=['is_published', 'is_draft'])
@@ -587,7 +730,8 @@ class ProjectPublishAPI(ExtensionView):
         return Response({'id': project.pk, 'is_published': True})
 
 
-class WebhookSerializer(serializers.Serializer):
+@extend_schema_serializer(component_name='CollaborationWebhook')
+class WebhookSerializer(StrictInput, serializers.Serializer):
     url = serializers.URLField(max_length=500)
     events = serializers.ListField(
         child=serializers.ChoiceField(choices=WebhookSubscription.EVENTS), allow_empty=False
@@ -609,6 +753,8 @@ class ProjectWebhooksAPI(ExtensionView):
             lambda page: [{'id': w.pk, 'url': w.url, 'events': w.events, 'active': w.active} for w in page],
         )
 
+    @transaction.atomic
+    @idempotent_mutation('webhook-create', redact_fields=('secret',))
     def post(self, request, pk):
         project = _project_for(request, pk)
         ser = WebhookSerializer(data=request.data)
@@ -637,11 +783,59 @@ class ProjectWebhookDetailAPI(ExtensionView):
         return Response(status=204)
 
 
-class ServiceAccountSerializer(serializers.Serializer):
+class WebhookDeliveriesAPI(ExtensionView):
+    required_scopes = {'GET': 'webhooks:write'}
+    permission_required = all_permissions.projects_change
+
+    def get(self, request, pk):
+        project = _project_for(request, pk)
+        jobs = WebhookDelivery.objects.filter(subscription__project=project).order_by('-pk')
+        return paginate(request, jobs, lambda page: [{
+            'id': job.pk, 'subscription': job.subscription_id, 'event': job.event, 'status': job.status,
+            'attempts': job.attempts, 'available_at': job.available_at, 'delivered_at': job.delivered_at,
+            'last_error': job.last_error,
+        } for job in page])
+
+
+class WebhookDeliveryRetryAPI(ExtensionView):
+    required_scopes = {'POST': 'webhooks:write'}
+    permission_required = all_permissions.projects_change
+
+    @transaction.atomic
+    def post(self, request, pk, delivery_id):
+        project = _project_for(request, pk)
+        job = get_object_or_404(WebhookDelivery.objects.select_for_update(), pk=delivery_id, subscription__project=project)
+        if not job.subscription.active or job.status == WebhookDelivery.Status.SENT:
+            raise serializers.ValidationError({'detail': 'Only undelivered active webhooks can be retried.'})
+        if job.status == WebhookDelivery.Status.SENDING and job.lease_until and job.lease_until > timezone.now():
+            return Response({'code': 'delivery_in_progress', 'detail': 'Delivery is currently in progress.', 'errors': {}}, status=409)
+        job.status, job.attempts, job.available_at, job.lease_until = WebhookDelivery.Status.PENDING, 0, timezone.now(), None
+        job.save()
+        audit.record(request, 'webhook.retry', project, 'webhook_delivery', job.pk)
+        return Response({'id': job.pk, 'status': job.status})
+
+
+class ServiceAccountSerializer(StrictInput, serializers.Serializer):
     name = serializers.CharField(max_length=100)
     scopes = serializers.ListField(child=serializers.ChoiceField(choices=ServiceAccount.SCOPES), allow_empty=False)
     project_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
-    role = serializers.ChoiceField(choices=['admin', 'qa'], default='admin')
+    all_projects = serializers.BooleanField(required=False, default=False)
+    active = serializers.BooleanField(required=False, default=True)
+    rotate_token = serializers.BooleanField(required=False, default=False)
+    role = serializers.ChoiceField(choices=['qa'], default='qa')
+
+    def validate(self, data):
+        if data.get('all_projects') and data.get('project_ids'):
+            raise serializers.ValidationError({'project_ids': 'Choose a project list or all_projects, not both.'})
+        return data
+
+
+def _service_data(account):
+    return {
+        'id': account.pk, 'user': account.user_id, 'name': account.name, 'scopes': account.scopes,
+        'project_ids': list(account.projects.order_by('pk').values_list('pk', flat=True)),
+        'all_projects': account.all_projects, 'active': account.active,
+    }
 
 
 class ServiceAccountsAPI(ExtensionView):
@@ -662,10 +856,11 @@ class ServiceAccountsAPI(ExtensionView):
             request,
             qs,
             lambda page: [
-                {'id': a.pk, 'user': a.user_id, 'name': a.name, 'scopes': a.scopes, 'active': a.active} for a in page
+                _service_data(a) for a in page
             ],
         )
 
+    @idempotent_mutation('service-account-create', hide_token=True)
     def post(self, request):
         self._check(request)
         ser = ServiceAccountSerializer(data=request.data)
@@ -685,25 +880,70 @@ class ServiceAccountsAPI(ExtensionView):
             user.save()
             org.add_user(user, role=data['role'])
             account = ServiceAccount.objects.create(
-                user=user, name=data['name'], scopes=sorted(set(data['scopes'])), created_by=request.user
+                user=user, name=data['name'], scopes=sorted(set(data['scopes'])), created_by=request.user,
+                all_projects=data['all_projects'], active=data['active'],
             )
+            user.is_active = account.active
+            user.save(update_fields=['is_active'])
             account.projects.set(projects)
-            token = user.reset_token()
+            token = issue_service_token(account)
             audit.record(request, 'service_account.create', None, 'service_account', account.pk, scopes=account.scopes)
         return Response(
-            {'id': account.pk, 'user': user.pk, 'name': account.name, 'scopes': account.scopes, 'token': token.key},
+            {**_service_data(account), 'token': token},
             status=201,
         )
 
 
-class ServiceAccountDetailAPI(ServiceAccountsAPI):
+class ServiceAccountDetailAPI(ExtensionView):
+    permission_required = all_permissions.projects_change
+    _check = ServiceAccountsAPI._check
+
+    def _account(self, request, pk):
+        self._check(request)
+        return get_object_or_404(
+            ServiceAccount.objects.filter(user__active_organization=request.user.active_organization), pk=pk
+        )
+
+    def get(self, request, pk):
+        return Response(_service_data(self._account(request, pk)))
+
+    @transaction.atomic
+    @idempotent_mutation('service-account-update', hide_token=True)
+    def patch(self, request, pk):
+        account = self._account(request, pk)
+        ser = ServiceAccountSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        if 'project_ids' in data:
+            projects = Project.objects.filter(pk__in=data['project_ids'], organization=request.user.active_organization)
+            if projects.count() != len(set(data['project_ids'])):
+                raise serializers.ValidationError({'project_ids': 'Unknown project.'})
+            account.projects.set(projects)
+        for field in ('name', 'scopes', 'all_projects', 'active'):
+            if field in data:
+                setattr(account, field, data[field])
+        if account.all_projects:
+            account.projects.clear()
+        if not account.active:
+            account.token_digest = None
+        account.save()
+        account.user.is_active = account.active
+        account.user.save(update_fields=['is_active'])
+        token = None
+        if account.active and (data.get('rotate_token') or account.token_digest is None):
+            token = issue_service_token(account)
+        audit.record(request, 'service_account.update', None, 'service_account', account.pk, fields=sorted(data))
+        return Response({**_service_data(account), **({'token': token} if token else {})})
+
+    @transaction.atomic
     def delete(self, request, pk):
         self._check(request)
         account = get_object_or_404(
             ServiceAccount.objects.filter(user__active_organization=request.user.active_organization), pk=pk
         )
         account.active = False
-        account.save(update_fields=['active'])
+        account.token_digest = None
+        account.save(update_fields=['active', 'token_digest'])
         account.user.is_active = False
         account.user.save(update_fields=['is_active'])
         from rest_framework.authtoken.models import Token
@@ -722,11 +962,10 @@ class AuditAPI(ExtensionView):
         if get_service_account(request.user) is not None or request.user.get_organization_role() != 'admin':
             raise PermissionDenied('Only organization administrators can read the audit trail.')
         org = request.user.active_organization
-        qs = AuditEvent.objects.filter(
-            Q(project__organization=org) | Q(project__isnull=True, actor__active_organization=org)
-        )
-        if request.query_params.get('project'):
-            qs = qs.filter(project_id=request.query_params['project'])
+        qs = AuditEvent.objects.filter(organization=org)
+        project_id = _query_id(request, 'project')
+        if project_id:
+            qs = qs.filter(project_id=project_id)
         if request.query_params.get('action'):
             qs = qs.filter(action=request.query_params['action'])
         return paginate(
@@ -747,3 +986,8 @@ class AuditAPI(ExtensionView):
                 for e in page
             ],
         )
+
+
+from collab.schema import install_schema
+
+install_schema(globals())

@@ -2,6 +2,7 @@ type DateTime = string;
 
 export interface APIAnnotation {
   id: number;
+  revision?: number;
   created_username?: string;
   created_ago: string;
   completed_by?: string;
@@ -79,6 +80,7 @@ export interface LSFTask extends LSFTaskData {
 
 export interface LSFAnnotationData {
   id?: string;
+  revision?: number;
 
   pk: string; // @todo oh, it's complicated
 

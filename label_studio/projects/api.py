@@ -9,6 +9,8 @@ from core.filters import ListFilter
 from core.label_config import config_essential_data_has_changed
 from core.mixins import GetParentObjectMixin
 from collab import privacy
+from collab.idempotency import idempotent_mutation, idempotent_project_create
+from collab.permissions import get_service_account
 from core.permissions import ViewClassPermission, all_permissions
 from core.redis import start_job_async_or_sync
 from core.utils.common import paginator, paginator_help, temporary_disconnect_all_signals
@@ -18,7 +20,7 @@ from core.utils.io import find_dir, find_file, read_yaml
 from core.utils.serializer_to_openapi_params import serializer_to_openapi_params
 from data_manager.functions import filters_ordering_selected_items_exist, get_prepared_queryset
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.http import Http404
 from django.utils.decorators import method_decorator
@@ -183,14 +185,9 @@ class ProjectListAPI(generics.ListCreateAPIView):
         serializer.is_valid(raise_exception=True)
         fields = serializer.validated_data.get('include')
         filter = serializer.validated_data.get('filter')
-        projects = Project.objects.filter(organization=self.request.user.active_organization).order_by(
+        projects = Project.objects.for_user(self.request.user).order_by(
             F('pinned_at').desc(nulls_last=True), '-created_at'
         )
-
-        # Labellers and QA only see projects they are assigned to
-        role = self.request.user.get_organization_role()
-        if role in ('labeller', 'qa'):
-            projects = projects.filter(members__user=self.request.user, members__enabled=True)
 
         if filter in ['pinned_only', 'exclude_pinned']:
             projects = projects.filter(pinned_at__isnull=filter == 'exclude_pinned')
@@ -211,7 +208,22 @@ class ProjectListAPI(generics.ListCreateAPIView):
 
     def perform_create(self, ser):
         try:
-            ser.save(organization=self.request.user.active_organization)
+            with transaction.atomic():
+                project = ser.save(organization=self.request.user.active_organization)
+                from collab.api import apply_policy
+
+                apply_policy(project, {
+                    'required_annotations': ser.validated_data.get('maximum_annotations', 2),
+                    'blind_mode': True,
+                    'assignment_mode': 'manual',
+                    'review_mode': 'manual',
+                })
+                # New projects start with explicit access. The no-membership
+                # compatibility fallback is reserved for existing projects.
+                ProjectMember.objects.get_or_create(project=project, user=self.request.user)
+                account = get_service_account(self.request.user)
+                if account is not None and not account.all_projects:
+                    account.projects.add(project)
         except IntegrityError as e:
             if str(e) == 'UNIQUE constraint failed: project.title, project.created_by_id':
                 raise ProjectExistException(
@@ -222,6 +234,7 @@ class ProjectListAPI(generics.ListCreateAPIView):
     def get(self, request, *args, **kwargs):
         return super(ProjectListAPI, self).get(request, *args, **kwargs)
 
+    @idempotent_project_create
     @api_webhook(WebhookAction.PROJECT_CREATED)
     def post(self, request, *args, **kwargs):
         return super(ProjectListAPI, self).post(request, *args, **kwargs)
@@ -256,9 +269,7 @@ class ProjectCountsListAPI(generics.ListAPIView):
         serializer = GetFieldsSerializer(data=self.request.query_params)
         serializer.is_valid(raise_exception=True)
         fields = serializer.validated_data.get('include')
-        projects = Project.objects.with_counts(fields=fields).filter(
-            organization=self.request.user.active_organization
-        )
+        projects = ProjectManager.with_counts_annotate(Project.objects.for_user(self.request.user), fields=fields)
 
         # Only annotate FSM state for UI/API consumption when both feature flags are enabled
         if flag_set('fflag_feat_fit_568_finite_state_management', user=self.request.user) and flag_set(
@@ -377,8 +388,8 @@ class ProjectAPI(generics.RetrieveUpdateDestroyAPIView):
     permission_required = ViewClassPermission(
         GET=all_permissions.projects_view,
         DELETE=all_permissions.projects_delete,
-        PATCH=all_permissions.projects_change,
-        PUT=all_permissions.projects_change,
+        PATCH=all_permissions.projects_create,
+        PUT=all_permissions.projects_create,
         POST=all_permissions.projects_create,
     )
     serializer_class = ProjectSerializer
@@ -390,9 +401,7 @@ class ProjectAPI(generics.RetrieveUpdateDestroyAPIView):
         serializer = GetFieldsSerializer(data=self.request.query_params)
         serializer.is_valid(raise_exception=True)
         fields = serializer.validated_data.get('include')
-        projects = Project.objects.with_counts(fields=fields).filter(
-            organization=self.request.user.active_organization
-        )
+        projects = ProjectManager.with_counts_annotate(Project.objects.for_user(self.request.user), fields=fields)
 
         # Only annotate FSM state for UI/API consumption when both feature flags are enabled
         if flag_set('fflag_feat_fit_568_finite_state_management', user=self.request.user) and flag_set(
@@ -457,6 +466,9 @@ class ProjectNextTaskAPI(generics.RetrieveAPIView):
 
     def get(self, request, *args, **kwargs):
         project = self.get_object()
+        from collab.lifecycle import ensure_project_writable
+
+        ensure_project_writable(project)
         dm_queue = filters_ordering_selected_items_exist(request.data)
         prepared_tasks = get_prepared_queryset(request, project)
 
@@ -776,7 +788,11 @@ class ProjectTaskListAPI(GetParentObjectMixin, generics.ListCreateAPIView, gener
     def get(self, *args, **kwargs):
         return super(ProjectTaskListAPI, self).get(*args, **kwargs)
 
-    @extend_schema(exclude=True)
+    @extend_schema(
+        summary='Create a project task',
+        description='Create one source task in an authorized project. Service accounts require imports:write and an Idempotency-Key.',
+    )
+    @idempotent_mutation('project-task-create')
     def post(self, *args, **kwargs):
         return super(ProjectTaskListAPI, self).post(*args, **kwargs)
 
@@ -869,10 +885,13 @@ class ProjectSampleTask(generics.RetrieveAPIView):
 @extend_schema(exclude=True)
 class ProjectModelVersions(generics.RetrieveAPIView):
     parser_classes = (JSONParser,)
-    permission_required = all_permissions.projects_view
+    permission_required = ViewClassPermission(
+        GET=all_permissions.projects_view,
+        DELETE=all_permissions.models_delete,
+    )
 
     def get_queryset(self):
-        return Project.objects.filter(organization=self.request.user.active_organization)
+        return Project.objects.for_user(self.request.user)
 
     def get(self, request, *args, **kwargs):
         project = self.get_object()
@@ -888,6 +907,9 @@ class ProjectModelVersions(generics.RetrieveAPIView):
             serializer = ProjectModelVersionExtendedSerializer(data, many=True)
 
             if include_live_models:
+                from ml.serializers import ensure_ml_management
+
+                ensure_ml_management(request.user)
                 ml_models = project.get_ml_backends()
                 serializer_models = MLBackendSerializer(ml_models, many=True)
 
@@ -897,6 +919,11 @@ class ProjectModelVersions(generics.RetrieveAPIView):
 
     def delete(self, request, *args, **kwargs):
         project = self.get_object()
+        from collab.lifecycle import ensure_project_writable
+
+        ensure_project_writable(project)
+        if not isinstance(request.data, dict):
+            raise RestValidationError('Expected a model version deletion object.')
         model_version = request.data.get('model_version', None)
 
         if not model_version:
@@ -944,16 +971,16 @@ class ProjectAnnotatorsAPI(generics.RetrieveAPIView):
 
 
 class ProjectMemberListAPI(generics.ListCreateAPIView):
-    """List and add members to a project. Admin only."""
+    """QA and admins may list project members; admins manage their access."""
 
     permission_required = ViewClassPermission(
         GET=all_permissions.projects_change,
-        POST=all_permissions.projects_change,
+        POST=all_permissions.projects_create,
     )
     serializer_class = ProjectMemberSerializer
 
     def get_project(self):
-        return generics.get_object_or_404(Project, pk=self.kwargs['pk'])
+        return generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
 
     def get_queryset(self):
         project = self.get_project()
@@ -992,13 +1019,16 @@ class ProjectMemberListAPI(generics.ListCreateAPIView):
 class ProjectMemberDetailAPI(generics.DestroyAPIView):
     """Remove a member from a project. Admin only."""
 
-    permission_required = all_permissions.projects_change
+    permission_required = all_permissions.projects_create
 
     def get_project(self):
-        return generics.get_object_or_404(Project, pk=self.kwargs['pk'])
+        return generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
 
     def delete(self, request, pk, user_pk):
         project = self.get_project()
         member = generics.get_object_or_404(ProjectMember, project=project, user_id=user_pk)
-        member.delete()
+        # Keep the explicit-access marker when the last member is removed: deleting
+        # the row would accidentally reopen this project through the legacy fallback.
+        member.enabled = False
+        member.save(update_fields=['enabled'])
         return Response(status=status.HTTP_204_NO_CONTENT)

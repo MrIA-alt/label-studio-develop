@@ -1,13 +1,16 @@
 import logging
+import json
 from functools import wraps
 
 import requests
+import urllib3
 from core.feature_flags import flag_set
 from core.redis import start_job_async_or_sync
 from core.utils.common import load_func
 from django.conf import settings
 from django.db.models import Q
 from django.db.models.query import QuerySet
+from rest_framework.exceptions import ValidationError
 
 from .models import Webhook, WebhookAction
 
@@ -49,16 +52,41 @@ def run_webhook_sync(webhook, action, payload=None):
         'action': action,
     }
     if webhook.send_payload and payload:
-        data.update(payload)
-    try:
-        logging.debug('Run webhook %s for action %s', webhook.id, action)
-        return requests.post(
-            webhook.url,
-            headers=webhook.headers,
-            json=data,
-            timeout=settings.WEBHOOK_TIMEOUT,
+        # Legacy hooks have no trustworthy approver. Keep event identifiers but
+        # require an administrator to save the hook before delivering private data.
+        from collab.models import ProjectAnnotationPolicy
+
+        blind = ProjectAnnotationPolicy.objects.filter(
+            blind_mode=True, project__organization_id=webhook.organization_id
         )
-    except requests.RequestException as exc:
+        if webhook.project_id:
+            blind = blind.filter(project_id=webhook.project_id)
+        if not webhook.approved_by_id and blind.exists():
+            def identifiers(value):
+                if isinstance(value, list):
+                    return [identifiers(item) for item in value]
+                if isinstance(value, dict):
+                    return {'id': value['id']} if 'id' in value else {}
+                return value if isinstance(value, int) else None
+
+            data.update({name: identifiers(value) for name, value in payload.items()})
+        else:
+            data.update(payload)
+    try:
+        from collab.webhooks import _post_once
+
+        logging.debug('Run webhook %s for action %s', webhook.id, action)
+        status_code = _post_once(
+            webhook.url, json.dumps(data, default=str).encode(),
+            {'Content-Type': 'application/json', **webhook.headers},
+        )
+        response = requests.Response()
+        response.status_code = status_code
+        return response
+    except ValidationError:
+        logger.warning('Blocked an unsafe native webhook target: webhook=%s', webhook.pk)
+        return
+    except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as exc:
         logging.error(exc, exc_info=True)
         return
 

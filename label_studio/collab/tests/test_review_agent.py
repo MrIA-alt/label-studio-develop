@@ -1,7 +1,6 @@
 import json
 
 import pytest
-import requests_mock as rm
 from collab import consensus, webhooks
 from collab.models import (
     AnnotationReview,
@@ -45,11 +44,11 @@ def test_review_flow_reject_visible_only_to_author_and_correction_history(env):
     assert len(view['annotations']) == 3
     assert view['agreement']['disagreement'] is True
 
-    assert qa.post(f'{EXT}/reviews', {'annotation': ann_a.id, 'decision': 'ACCEPT'}, format='json').status_code == 201
-    no_comment = qa.post(f'{EXT}/reviews', {'annotation': ann_b.id, 'decision': 'REJECT'}, format='json')
+    assert qa.post(f'{EXT}/reviews', {'annotation': ann_a.id, 'revision': ann_a.revision, 'decision': 'ACCEPT'}, format='json').status_code == 201
+    no_comment = qa.post(f'{EXT}/reviews', {'annotation': ann_b.id, 'revision': ann_b.revision, 'decision': 'REJECT'}, format='json')
     assert no_comment.status_code == 400
     ok = qa.post(
-        f'{EXT}/reviews', {'annotation': ann_b.id, 'decision': 'REJECT', 'comment': 'wrong class'}, format='json'
+        f'{EXT}/reviews', {'annotation': ann_b.id, 'revision': ann_b.revision, 'decision': 'REJECT', 'comment': 'wrong class'}, format='json'
     )
     assert ok.status_code == 201
 
@@ -64,10 +63,10 @@ def test_review_flow_reject_visible_only_to_author_and_correction_history(env):
     states = {a.user_id: a.status for a in TaskAssignment.objects.all()}
     assert states[env['b'].pk] == TaskAssignment.Status.REWORK_REQUIRED
     assert states[env['a'].pk] == TaskAssignment.Status.CLOSED
-    locked = client_for(env['a']).patch(f'/api/annotations/{ann_a.id}/', {'result': result('b')}, format='json')
+    locked = client_for(env['a']).patch(f'/api/annotations/{ann_a.id}/', {'result': result('b'), 'revision': ann_a.revision}, format='json')
     assert locked.status_code == 403
 
-    fixed = client_for(env['b']).patch(f'/api/annotations/{ann_b.id}/', {'result': result('a')}, format='json')
+    fixed = client_for(env['b']).patch(f'/api/annotations/{ann_b.id}/', {'result': result('a'), 'revision': ann_b.revision}, format='json')
     assert fixed.status_code == 200
     assert AnnotationRevision.objects.filter(annotation=ann_b).count() == 1
     assert TaskAssignment.objects.get(user=env['b']).status == TaskAssignment.Status.SUBMITTED
@@ -115,7 +114,7 @@ def test_consensus_metrics():
 
 def test_service_account_scopes_project_restriction_and_revocation(env):
     admin = client_for(env['admin'])
-    resp = admin.post(f'{EXT}/service-accounts', {'name': 'bot', 'scopes': ['progress:read']}, format='json')
+    resp = admin.post(f'{EXT}/service-accounts', {'name': 'bot', 'scopes': ['progress:read'], 'project_ids': [env['project'].pk]}, format='json')
     assert resp.status_code == 201
     assert resp.json()['token']
     svc = ServiceAccount.objects.get(pk=resp.json()['id'])
@@ -134,7 +133,9 @@ def test_service_account_scopes_project_restriction_and_revocation(env):
     assert bot.get(f'{EXT}/projects/{other.id}/progress').status_code in (403, 404)
 
     assert admin.delete(f'{EXT}/service-accounts/{svc.pk}').status_code == 204
-    assert client_for(svc.user).get(f'{EXT}/projects/{pid}/progress').status_code in (401, 403)
+    from users.models import User
+
+    assert client_for(User.objects.get(pk=svc.user_id)).get(f'{EXT}/projects/{pid}/progress').status_code in (401, 403)
     actions = set(AuditEvent.objects.values_list('action', flat=True))
     assert {'service_account.create', 'service_account.revoke'} <= actions
     assert admin.get(f'{EXT}/audit').status_code == 200
@@ -144,7 +145,7 @@ def test_service_account_scopes_project_restriction_and_revocation(env):
 def test_agent_end_to_end_project_creation_import_progress_results(env):
     admin = client_for(env['admin'])
     scopes = ['projects:write', 'policy:write', 'assignments:read', 'assignments:write', 'progress:read',
-              'results:read', 'native']
+              'results:read', 'projects:read', 'policy:read', 'imports:write']
     created = admin.post(f'{EXT}/service-accounts', {'name': 'agent', 'scopes': scopes}, format='json').json()
     bot = client_for(ServiceAccount.objects.get(pk=created['id']).user)
 
@@ -169,7 +170,7 @@ def test_agent_end_to_end_project_creation_import_progress_results(env):
     assert project.is_published
     assert project.annotation_policy.blind_mode is True
 
-    imp = bot.post(f'/api/projects/{pid}/import', [{'text': f't{i}'} for i in range(10)], format='json')
+    imp = bot.post(f'/api/projects/{pid}/import', [{'text': f't{i}'} for i in range(10)], format='json', HTTP_IDEMPOTENCY_KEY='import-agent-e2e')
     assert imp.status_code == 201, imp.content
     assert Task.objects.filter(project=project).count() == 10
 
@@ -177,6 +178,9 @@ def test_agent_end_to_end_project_creation_import_progress_results(env):
     from organizations.models import OrganizationMember
 
     c = make_user(project.organization, 'c@x.io', OrganizationMember.Role.LABELLER)
+    from projects.models import ProjectMember
+
+    ProjectMember.objects.create(project=project, user=c)
     task_ids = list(Task.objects.filter(project=project).values_list('id', flat=True))
     bulk = bot.post(
         f'{EXT}/projects/{pid}/assignments/bulk',
@@ -191,10 +195,10 @@ def test_agent_end_to_end_project_creation_import_progress_results(env):
     assert progress.json()['annotations']['total'] == 0
     results = bot.get(f'{EXT}/projects/{pid}/results?only=accepted')
     assert results.status_code == 200
-    assert results.json()['count'] == 10
+    assert results.json()['count'] == 0
 
 
-def test_webhook_signature_ssrf_and_failure_audit(env, settings):
+def test_webhook_signature_ssrf_and_failure_audit(env, settings, monkeypatch):
     admin = client_for(env['admin'])
     pid = env['project'].id
     bad = admin.post(
@@ -203,6 +207,7 @@ def test_webhook_signature_ssrf_and_failure_audit(env, settings):
     assert bad.status_code == 400
 
     settings.COLLAB_WEBHOOK_ALLOW_PRIVATE = True
+    monkeypatch.setattr(webhooks.socket, 'getaddrinfo', lambda *args, **kwargs: [(2, 1, 6, '', ('127.0.0.1', 80))])
     good = admin.post(
         f'{EXT}/projects/{pid}/webhooks',
         {'url': 'http://hooks.example.test/in', 'events': ['review.decided']},
@@ -213,17 +218,19 @@ def test_webhook_signature_ssrf_and_failure_audit(env, settings):
     sub = WebhookSubscription.objects.get(pk=good.json()['id'])
     assert 'secret' not in admin.get(f'{EXT}/projects/{pid}/webhooks').json()['results'][0]
 
-    with rm.Mocker() as m:
-        m.post('http://hooks.example.test/in', status_code=200)
-        assert webhooks.deliver(sub, 'review.decided', {'task': 1}) is True
-        req = m.request_history[0]
-        ts = req.headers['X-Collab-Timestamp']
-        assert req.headers['X-Collab-Signature'] == 'sha256=' + webhooks.sign(secret, ts, req.body)
+    posted = []
+    def successful_post(url, body, headers):
+        posted.append((body, headers))
+        return 200
+    monkeypatch.setattr(webhooks, '_post_once', successful_post)
+    assert webhooks.deliver(sub, 'review.decided', {'task': 1}) is True
+    body, headers = posted[0]
+    ts = headers['X-Collab-Timestamp']
+    assert headers['X-Collab-Signature'] == 'sha256=' + webhooks.sign(secret, ts, body)
 
-    with rm.Mocker() as m:
-        m.post('http://hooks.example.test/in', status_code=500)
-        webhooks.time.sleep = lambda *_: None
-        assert webhooks.deliver(sub, 'review.decided', {'task': 1}) is False
+    monkeypatch.setattr(webhooks, '_post_once', lambda *_: 500)
+    monkeypatch.setattr(webhooks.time, 'sleep', lambda *_: None)
+    assert webhooks.deliver(sub, 'review.decided', {'task': 1}) is False
     assert AuditEvent.objects.filter(action='webhook.delivery_failed').exists()
 
 

@@ -1,0 +1,70 @@
+# Fully disposable test environment. Never uses the application's environment file,
+# database, media volumes or signing key. The credentials below are test fixtures.
+name: label-studio-collab-tests
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: collab_test
+      POSTGRES_USER: collab_test
+      POSTGRES_PASSWORD: synthetic-test-database-password
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collab_test -d collab_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    image: ${COLLAB_TEST_IMAGE:-label-studio-collab:local}
+    working_dir: /label-studio/label_studio
+    entrypoint: ["python", "-B", "-m", "pytest"]
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.label_studio
+      DJANGO_DB: postgresql
+      POSTGRE_NAME: collab_test
+      POSTGRE_USER: collab_test
+      POSTGRE_PASSWORD: synthetic-test-database-password
+      POSTGRE_HOST: db
+      POSTGRE_PORT: "5432"
+      SECRET_KEY: synthetic-test-signing-key-never-used-by-the-application
+      BASE_DATA_DIR: /tmp/collab-test-data
+      LABEL_STUDIO_BASE_DATA_DIR: /tmp/collab-test-data
+      TEST_ENVIRONMENT: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      COLLECT_ANALYTICS: "0"
+      LATEST_VERSION_CHECK: "0"
+      SENTRY_DSN: ""
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - collab/tests
+      - tests/test_annotations.py
+      - tests/test_annotations_result_count.py
+      - tests/data_manager
+      - tests/tasks
+      - tests/test_project.py
+      - tests/test_project_validation.py
+      - tests/test_project_reset_summary.py
+      - tests/test_export.py
+      - tests/test_tasks_upload.py
+      - tests/data_import
+      - tests/webhooks/test_webhooks.py
+      - tests/test_organizations.py
+      - organizations/tests/test_api.py
+      - projects/tests/test_api.py
+      - projects/tests/test_project_sample_task.py
+      - fsm/tests/test_api.py
+      - fsm/tests/test_bulk_initial_state_cache.py
+      - tests/ml/test_api.py
+      - tests/ml/test_predict.py
+      - -q
+      - -n0
+      - -p
+      - no:cacheprovider
+      - --tb=short
+      - --show-capture=no
+      - --junitxml=/tmp/collab-test-results.xml

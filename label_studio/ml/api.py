@@ -2,6 +2,7 @@
 """
 import logging
 
+from collab.lifecycle import is_archived
 from core.feature_flags import flag_set
 from core.permissions import ViewClassPermission, all_permissions
 from django.conf import settings
@@ -10,9 +11,16 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from ml.models import MLBackend
-from ml.serializers import MLBackendSerializer, MLInteractiveAnnotatingRequest
+from ml.serializers import (
+    MLBackendSerializer,
+    MLBackendSummarySerializer,
+    MLInteractiveAnnotatingRequest,
+    can_manage_ml,
+    ensure_ml_management,
+)
 from projects.models import Project, Task
 from rest_framework import generics, status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -64,7 +72,6 @@ _ml_backend_schema = {
             'description': 'Response model timeout',
         },
     },
-    'required': [],
 }
 
 
@@ -125,13 +132,21 @@ class MLBackendListAPI(generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['is_interactive']
 
+    def get_serializer_class(self):
+        if self.request.method in ('GET', 'HEAD') and not can_manage_ml(self.request.user):
+            return MLBackendSummarySerializer
+        return self.serializer_class
+
     def get_queryset(self):
         project_pk = self.request.query_params.get('project')
         project = generics.get_object_or_404(Project, pk=project_pk)
 
         self.check_object_permissions(self.request, project)
 
-        ml_backends = project.update_ml_backends_state()
+        ml_backends = (
+            project.update_ml_backends_state()
+            if can_manage_ml(self.request.user) and not is_archived(project) else project.get_ml_backends()
+        )
 
         return ml_backends
 
@@ -218,12 +233,21 @@ class MLBackendListAPI(generics.ListCreateAPIView):
 class MLBackendDetailAPI(generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     serializer_class = MLBackendSerializer
-    permission_required = all_permissions.projects_change
+    permission_required = ViewClassPermission(
+        GET=all_permissions.projects_view,
+        PATCH=all_permissions.projects_change,
+        PUT=all_permissions.projects_change,
+        DELETE=all_permissions.projects_change,
+    )
     queryset = MLBackend.objects.all()
+    get_serializer_class = MLBackendListAPI.get_serializer_class
 
     def get_object(self):
         ml_backend = super(MLBackendDetailAPI, self).get_object()
-        ml_backend.update_state()
+        if self.request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            ensure_ml_management(self.request.user, ml_backend.project)
+        if can_manage_ml(self.request.user) and not is_archived(ml_backend.project):
+            ml_backend.update_state()
         return ml_backend
 
     def perform_update(self, serializer):
@@ -286,6 +310,7 @@ class MLBackendTrainAPI(APIView):
     def post(self, request, *args, **kwargs):
         ml_backend = generics.get_object_or_404(MLBackend, pk=self.kwargs['pk'])
         self.check_object_permissions(self.request, ml_backend)
+        ensure_ml_management(request.user, ml_backend.project)
 
         ml_backend.train()
         return Response(status=status.HTTP_200_OK)
@@ -332,6 +357,7 @@ class MLBackendPredictTestAPI(APIView):
     def post(self, request, *args, **kwargs):
         ml_backend = generics.get_object_or_404(MLBackend, pk=self.kwargs['pk'])
         self.check_object_permissions(self.request, ml_backend)
+        ensure_ml_management(request.user, ml_backend.project)
 
         random = request.query_params.get('random', False)
         if random:
@@ -344,7 +370,7 @@ class MLBackendPredictTestAPI(APIView):
                     },
                 )
 
-            kwargs = ml_backend._predict(task)
+            kwargs = ml_backend._predict(task, request=request)
             if not kwargs:
                 return Response(
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -403,7 +429,16 @@ class MLBackendInteractiveAnnotating(APIView):
         return Response({'errors': [message]}, status=status.HTTP_200_OK)
 
     def _get_task(self, ml_backend, validated_data):
-        return generics.get_object_or_404(Task, pk=validated_data['task'], project=ml_backend.project)
+        task = generics.get_object_or_404(Task, pk=validated_data['task'], project=ml_backend.project)
+        self.check_object_permissions(self.request, task)
+        from collab import privacy
+
+        policy = privacy.get_policy(task.project)
+        if policy and not policy.allow_predictions and (
+            privacy.is_restricted_user(self.request.user) or privacy.is_blind_for(self.request.user, task.project)
+        ):
+            raise PermissionDenied('Predictions are disabled for this campaign.')
+        return task
 
     def _get_credentials(self, request, context, project):
         if flag_set('ff_back_dev_2362_project_credentials_060722_short', request.user):

@@ -111,7 +111,9 @@ class ProjectManager(models.Manager):
         return ProjectQuerySetWithFSM(self.model, using=self._db)
 
     def for_user(self, user):
-        return self.get_queryset().filter(organization=user.active_organization)
+        from collab.privacy import scope_projects
+
+        return scope_projects(self.get_queryset(), user)
 
     def with_state(self):
         """

@@ -370,7 +370,24 @@ def project_id(business_client):
         data=json.dumps(payload),
         content_type='application/json',
     )
-    return response.json()['id']
+    project = Project.objects.get(pk=response.json()['id'])
+    use_native_project_workflow(project)
+    return project.pk
+
+
+def use_native_project_workflow(project, maximum_annotations=1):
+    """Select the historical Community workflow for native compatibility fixtures.
+
+    API creation defaults are tested separately in collab/tests. These fixtures
+    exercise imports, exports and Data Manager on projects without a policy,
+    including historical results whose author is unknown.
+    """
+    from collab.models import ProjectAnnotationPolicy
+
+    ProjectAnnotationPolicy.objects.filter(project=project).delete()
+    project.maximum_annotations = maximum_annotations
+    project.save(update_fields=['maximum_annotations'])
+    project.__dict__.pop('_collab_policy', None)
 
 
 def make_task(config, project):
@@ -426,6 +443,13 @@ def invite_client_to_project(client, project):
     if apps.is_installed('annotators'):
         return client.get(f'/annotator/invites/{project.token}/')
     else:
+        from organizations.models import OrganizationMember
+        from projects.models import ProjectMember
+
+        project.organization.add_user(client.user, role=OrganizationMember.Role.LABELLER)
+        ProjectMember.objects.update_or_create(project=project, user=client.user, defaults={'enabled': True})
+        client.user.active_organization = project.organization
+        client.user.save(update_fields=['active_organization'])
         return SimpleNamespace(status_code=200)
 
 
@@ -454,6 +478,11 @@ def save_response(response):
     fp = os.path.join(settings.TEST_DATA_ROOT, 'tavern-output.json')
     with open(fp, 'w') as f:
         json.dump(response.json(), f)
+
+
+def assert_task_data_password_is_not_returned(response):
+    """Project responses must never expose stored source credentials."""
+    assert 'task_data_password' not in response.json()
 
 
 def os_independent_path(_, path, add_tempdir=False):

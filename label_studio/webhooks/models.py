@@ -30,6 +30,11 @@ class Webhook(models.Model):
     """
 
     organization = models.ForeignKey('organizations.Organization', on_delete=models.CASCADE, related_name='webhooks')
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='approved_native_webhooks',
+        help_text='Administrator or scoped service account that approved full payload delivery.',
+    )
 
     project = models.ForeignKey(
         'projects.Project', null=True, on_delete=models.CASCADE, related_name='webhooks', default=None

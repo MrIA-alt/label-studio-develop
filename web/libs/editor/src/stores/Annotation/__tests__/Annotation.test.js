@@ -54,6 +54,12 @@ function createStoreWithAnnotation(annotationSnapshot = {}) {
 
 describe("Annotation model", () => {
   describe("creation and snapshot", () => {
+    it("keeps the server revision attached to the loaded annotation", () => {
+      const { annotation } = createStoreWithAnnotation({ revision: 7 });
+      expect(annotation.revision).toBe(7);
+      annotation.setRevision(8);
+      expect(annotation.revision).toBe(8);
+    });
     it("creates annotation with default type and editable", () => {
       const { annotation } = createStoreWithAnnotation();
       expect(annotation.type).toBe("annotation");

@@ -65,6 +65,16 @@ pytestmark = pytest.mark.django_db
 
 
 class TestDownloadStorageData:
+    @pytest.fixture(autouse=True)
+    def upload_access(self):
+        """Keep file transport tests isolated from the database ACL helper.
+
+        Real tenant, assignment and source/result boundaries are exercised by
+        collab/tests/test_access_boundaries.py with real persisted objects.
+        """
+        with mock.patch('data_import.api.privacy.can_access_upload', side_effect=lambda user, upload: bool(upload and upload.has_permission(user))):
+            yield
+
     @pytest.fixture
     def api_factory(self):
         return APIRequestFactory()

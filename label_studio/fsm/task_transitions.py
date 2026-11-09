@@ -70,6 +70,11 @@ class TaskCompletedTransition(ModelChangeTransition):
     def get_target_state(self, context: Optional[TransitionContext] = None) -> str:
         return TaskStateChoices.COMPLETED
 
+    def should_execute(self, context: TransitionContext) -> bool:
+        from collab.privacy import get_policy
+
+        return get_policy(context.entity.project) is None or context.entity._get_is_labeled_value()
+
     def get_reason(self, context: TransitionContext) -> str:
         return 'Task completed - annotation submitted'
 
@@ -95,6 +100,11 @@ class TaskInProgressTransition(ModelChangeTransition):
 
     def get_target_state(self, context: Optional[TransitionContext] = None) -> str:
         return TaskStateChoices.IN_PROGRESS
+
+    def should_execute(self, context: TransitionContext) -> bool:
+        from collab.privacy import get_policy
+
+        return get_policy(context.entity.project) is None or not context.entity._get_is_labeled_value()
 
     def get_reason(self, context: TransitionContext) -> str:
         return 'Task moved to in progress - annotations deleted'

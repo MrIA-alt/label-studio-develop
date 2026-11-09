@@ -4,6 +4,7 @@ strict: false
 marks:
 - usefixtures:
   - django_live_url
+  - native_project_workflow
 stages:
 - id: signup
   type: ref

@@ -4,6 +4,9 @@ import json
 import logging
 import mimetypes
 import time
+from collections.abc import Mapping
+from collab import privacy
+from collab.idempotency import idempotent_import
 from urllib.parse import unquote, urlparse
 
 from core.decorators import override_report_only_csp
@@ -24,10 +27,9 @@ from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_sche
 from label_studio_sdk.label_interface import LabelInterface
 from projects.models import Project, ProjectImport, ProjectReimport
 from ranged_fileresponse import RangedFileResponse
-from rest_framework import generics, status
-from rest_framework.exceptions import ValidationError
+from rest_framework import generics, serializers, status
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rest_framework.views import APIView
@@ -54,6 +56,15 @@ from .uploader import create_file_uploads, load_tasks
 logger = logging.getLogger(__name__)
 
 ProjectImportPermission = load_func(settings.PROJECT_IMPORT_PERMISSION)
+
+
+def _project_for_import(request, pk):
+    from collab.lifecycle import ensure_project_writable
+
+    project = generics.get_object_or_404(Project.objects.for_user(request.user), pk=pk)
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        ensure_project_writable(project)
+    return project
 
 task_create_response_scheme = {
     201: OpenApiResponse(
@@ -253,7 +264,7 @@ task_create_response_scheme = {
 )
 # Import
 class ImportAPI(generics.CreateAPIView):
-    permission_required = all_permissions.projects_change
+    permission_required = all_permissions.tasks_create
     permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES + [ProjectImportPermission]
     parser_classes = (JSONParser, MultiPartParser, FormParser)
     serializer_class = ImportApiSerializer
@@ -262,11 +273,12 @@ class ImportAPI(generics.CreateAPIView):
     def get_serializer_context(self):
         project_id = self.kwargs.get('pk')
         if project_id:
-            project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=project_id)
+            project = _project_for_import(self.request, project_id)
         else:
             project = None
         return {'project': project, 'user': self.request.user}
 
+    @idempotent_import
     def post(self, *args, **kwargs):
         return super(ImportAPI, self).post(*args, **kwargs)
 
@@ -274,7 +286,7 @@ class ImportAPI(generics.CreateAPIView):
         serializer = self.get_serializer(data=tasks, many=True)
         serializer.is_valid(raise_exception=True)
         task_instances = serializer.save(project_id=self.kwargs['pk'])
-        project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        project = _project_for_import(self.request, self.kwargs['pk'])
         emit_webhooks_for_instance(
             self.request.user.active_organization, project, WebhookAction.TASKS_CREATED, task_instances
         )
@@ -428,7 +440,7 @@ class ImportAPI(generics.CreateAPIView):
         preannotated_from_fields = list_of_strings_from_request(request.query_params, 'preannotated_from_fields', None)
 
         # check project permissions
-        project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        project = _project_for_import(self.request, self.kwargs['pk'])
 
         if settings.VERSION_EDITION != 'Community':
             return self.async_import(request, project, preannotated_from_fields, commit_to_project, return_task_ids)
@@ -494,10 +506,20 @@ class ImportPredictionsAPI(generics.CreateAPIView):
     parser_classes = (JSONParser, MultiPartParser, FormParser)
     serializer_class = PredictionSerializer
     queryset = Project.objects.all()
+    idempotency_operation = 'prediction-import'
+
+    @extend_schema(parameters=[OpenApiParameter(
+        'Idempotency-Key', OpenApiTypes.STR, location=OpenApiParameter.HEADER,
+        description='Required for service-account imports; optional for humans. Reuse the same key and body after a network failure.',
+    )])
+    @idempotent_import
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
     def create(self, request, *args, **kwargs):
         # check project permissions
         project = self.get_object()
+        serializers.ListField(child=serializers.DictField()).run_validation(request.data)
 
         # Use feature flag to control memory-efficient implementation rollout
         if flag_set('fflag_fix_back_4620_memory_efficient_predictions_import_08012025_short', user=self.request.user):
@@ -652,7 +674,8 @@ class TasksBulkCreateAPI(ImportAPI):
 
 
 class ReImportAPI(ImportAPI):
-    permission_required = all_permissions.projects_change
+    # Reimport replaces source tasks and cascades through their annotations.
+    permission_required = all_permissions.tasks_delete
 
     def sync_reimport(self, project, file_upload_ids, files_as_tasks_list):
         start = time.time()
@@ -721,11 +744,18 @@ class ReImportAPI(ImportAPI):
 
     @retry_database_locked()
     def create(self, request, *args, **kwargs):
+        if not isinstance(request.data, Mapping):
+            raise ValidationError('Expected a reimport object.')
         files_as_tasks_list = bool_from_request(request.data, 'files_as_tasks_list', True)
         file_upload_ids = self.request.data.get('file_upload_ids')
+        if file_upload_ids is not None:
+            file_upload_ids = serializers.ListField(child=serializers.IntegerField(min_value=1)).run_validation(file_upload_ids)
 
         # check project permissions
-        project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        project = _project_for_import(self.request, self.kwargs['pk'])
+
+        if file_upload_ids and FileUpload.objects.filter(project=project, pk__in=file_upload_ids).count() != len(set(file_upload_ids)):
+            raise ValidationError('Unknown uploaded source file for this project.')
 
         if not file_upload_ids:
             return Response(
@@ -808,12 +838,12 @@ class FileUploadListAPI(generics.mixins.ListModelMixin, generics.mixins.DestroyM
     serializer_class = FileUploadSerializer
     permission_required = ViewClassPermission(
         GET=all_permissions.projects_view,
-        DELETE=all_permissions.projects_change,
+        DELETE=all_permissions.tasks_delete,
     )
     queryset = FileUpload.objects.all()
 
     def get_queryset(self):
-        project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs.get('pk', 0))
+        project = _project_for_import(self.request, self.kwargs.get('pk', 0))
         if project.is_draft or bool_from_request(self.request.query_params, 'all', False):
             # If project is in draft state, we return all uploaded files, ignoring queried ids
             logger.debug(f'Return all uploaded files for draft project {project}')
@@ -828,14 +858,15 @@ class FileUploadListAPI(generics.mixins.ListModelMixin, generics.mixins.DestroyM
         return self.list(request, *args, **kwargs)
 
     def delete(self, request, *args, **kwargs):
-        project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        project = _project_for_import(self.request, self.kwargs['pk'])
+        if not isinstance(request.data, Mapping):
+            raise ValidationError('Expected a file deletion object.')
         ids = self.request.data.get('file_upload_ids')
         if ids is None:
             deleted, _ = FileUpload.objects.filter(project=project).delete()
-        elif isinstance(ids, list):
-            deleted, _ = FileUpload.objects.filter(project=project, id__in=ids).delete()
         else:
-            raise ValueError('"file_upload_ids" parameter must be a list of integers')
+            ids = serializers.ListField(child=serializers.IntegerField(min_value=1)).run_validation(ids)
+            deleted, _ = FileUpload.objects.filter(project=project, id__in=ids).delete()
         return Response({'deleted': deleted}, status=status.HTTP_200_OK)
 
 
@@ -881,9 +912,24 @@ class FileUploadListAPI(generics.mixins.ListModelMixin, generics.mixins.DestroyM
 )
 class FileUploadAPI(generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, MultiPartParser, FormParser)
-    permission_classes = (IsAuthenticated,)
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_required = ViewClassPermission(
+        GET=all_permissions.tasks_view,
+        PUT=all_permissions.tasks_change,
+        PATCH=all_permissions.tasks_change,
+        DELETE=all_permissions.tasks_delete,
+    )
     serializer_class = FileUploadSerializer
     queryset = FileUpload.objects.all()
+
+    def get_queryset(self):
+        return FileUpload.objects.filter(project__in=Project.objects.for_user(self.request.user))
+
+    def get_object(self):
+        upload = super().get_object()
+        if self.request.method == 'GET' and not privacy.can_access_upload(self.request.user, upload):
+            raise PermissionDenied('You do not have permission to this file.')
+        return upload
 
     def get(self, *args, **kwargs):
         return super(FileUploadAPI, self).get(*args, **kwargs)
@@ -918,7 +964,8 @@ class FileUploadAPI(generics.RetrieveUpdateDestroyAPIView):
 class UploadedFileResponse(generics.RetrieveAPIView):
     """Serve uploaded files from local drive"""
 
-    permission_classes = (IsAuthenticated,)
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_required = all_permissions.tasks_view
 
     @override_report_only_csp
     @csp(SANDBOX=[])
@@ -930,7 +977,7 @@ class UploadedFileResponse(generics.RetrieveAPIView):
         logger.debug(f'Fetch uploaded file by user {request.user} => {file}')
         file_upload = FileUpload.objects.filter(file=file).last()
 
-        if not file_upload.has_permission(request.user):
+        if not privacy.can_access_upload(request.user, file_upload):
             return Response(status=status.HTTP_403_FORBIDDEN)
 
         file = file_upload.file
@@ -974,7 +1021,8 @@ class DownloadStorageData(APIView):
     """
 
     http_method_names = ['get']
-    permission_classes = (IsAuthenticated,)
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_required = all_permissions.tasks_view
 
     def get(self, request, *args, **kwargs):
         """Get export files list"""
@@ -989,7 +1037,7 @@ class DownloadStorageData(APIView):
             logger.debug(f'Fetch uploaded file by user {request.user} => {filepath}')
             file_upload = FileUpload.objects.filter(file=filepath).last()
 
-            if file_upload is not None and file_upload.has_permission(request.user):
+            if privacy.can_access_upload(request.user, file_upload):
                 file_obj = file_upload.file
         elif filepath.startswith(settings.AVATAR_PATH):
             user = User.objects.filter(avatar=filepath).first()
@@ -1041,13 +1089,14 @@ class MicrophoneUploadAPI(APIView):
     """
 
     parser_classes = (MultiPartParser, FormParser)
-    permission_classes = (IsAuthenticated,)
+    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_required = all_permissions.annotations_create
 
     def post(self, request, pk):
         import os
         import shutil
 
-        project = generics.get_object_or_404(Project.objects.for_user(request.user), pk=pk)
+        project = _project_for_import(request, pk)
 
         audio_file = request.FILES.get('audio')
         if not audio_file:
